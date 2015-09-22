@@ -526,8 +526,7 @@ get_default_providers = lambda: {
         "auth": "password",
         "folder_map": {"INBOX.Archive": "archive",
                        "INBOX.Drafts": "drafts", "INBOX.Junk Mail": "spam",
-                       "INBOX.Trash": "trash", "INBOX.Sent Items": "sent",
-                       "INBOX.Sent": "sent"},
+                       "INBOX.Sent Items": "sent", "INBOX.Trash": "trash"},
     }
 }
 
