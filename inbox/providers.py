@@ -503,13 +503,13 @@ get_default_providers = lambda: {
         "auth":"password",
         "mx_servers":["mxbiz1.qq.com", "mxbiz2.qq.com"]
     },
-    "aliyun":{
-        "type":"generic",
-        "imap":("imap.aliyun.com", 993),
-        "smtp":("smtp.aliyun.com", 465),
-        "auth":"password",
-        "domains":"aliyun",
-        "mx_servers":["mx2.mail.aliyun.com"]
+    "aliyun": {
+        "type": "generic",
+        "imap": ("imap.aliyun.com", 993),
+        "smtp": ("smtp.aliyun.com", 465),
+        "auth": "password",
+        "domains": ["aliyun"],
+        "mx_servers": ["mx2.mail.aliyun.com"]
     },
     "139":{
         "type":"generic",
