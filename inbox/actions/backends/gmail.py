@@ -4,6 +4,7 @@ from inbox.crispin import writable_connection_pool
 from inbox.actions.backends.generic import (set_remote_starred,
                                             set_remote_unread,
                                             remote_delete_draft,
+                                            remote_update_draft,
                                             remote_save_draft,
                                             uids_by_folder)
 from inbox.mailsync.backends.imap.generic import uidvalidity_cb
@@ -12,8 +13,9 @@ from inbox.models.category import Category
 PROVIDER = 'gmail'
 
 __all__ = ['set_remote_starred', 'set_remote_unread', 'remote_save_draft',
-           'remote_change_labels', 'remote_delete_draft',
-           'remote_create_label', 'remote_update_label', 'remote_delete_label']
+           'remote_update_draft', 'remote_change_labels',
+           'remote_delete_draft', 'remote_create_label', 'remote_update_label',
+           'remote_delete_label']
 
 
 # Lifted from imaplib. Quote arguments ourselves, pending fix in imapclient.
