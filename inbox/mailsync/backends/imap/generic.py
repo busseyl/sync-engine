@@ -154,7 +154,8 @@ class FolderSyncEngine(Greenlet):
 
     def _run(self):
         # Bind greenlet-local logging context.
-        self.log = log.new(account_id=self.account_id, folder=self.folder_name)
+        self.log = log.new(account_id=self.account_id, folder=self.folder_name,
+                           provider=self.provider_name)
         # eagerly signal the sync status
         self.heartbeat_status.publish()
         return retry_with_logging(self._run_impl, account_id=self.account_id,
@@ -560,6 +561,11 @@ class FolderSyncEngine(Greenlet):
             # response.
             log.warning('Error getting UIDNEXT', exc_info=True)
             remote_uidnext = None
+        except imaplib.IMAP4.error as e:
+            if '[NONEXISTENT]' in e.message:
+                raise FolderMissingError()
+            else:
+                raise e
         if remote_uidnext is not None and remote_uidnext == self.uidnext:
             return
         log.info('UIDNEXT changed, checking for new UIDs',

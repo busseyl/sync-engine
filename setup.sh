@@ -73,6 +73,7 @@ echo "mysql-server mysql-server/root_password_again password root";
 
 color '35;1' 'Installing dependencies from apt-get...'
 apt-get -y install git \
+                   mercurial \
                    wget \
                    supervisor \
                    mysql-server \
@@ -172,9 +173,9 @@ fi
 color '35;1' 'Ensuring setuptools and pip versions...'
 # If python-setuptools is actually the old 'distribute' fork of setuptools,
 # then the first 'pip install setuptools' will be a no-op.
-pip install 'pip>=1.5.6' 'setuptools>=5.3'
+pip install 'pip>=1.5.6' 'setuptools>=17.1'
 hash pip        # /usr/bin/pip might now be /usr/local/bin/pip
-pip install 'pip>=1.5.6' 'setuptools>=5.3'
+pip install 'pip>=1.5.6' 'setuptools>=17.1'
 
 # Doing pip upgrade setuptools leaves behind this problematic symlink
 rm -rf /usr/lib/python2.7/dist-packages/setuptools.egg-info
@@ -292,7 +293,7 @@ color '35;1' 'Cleaning up...'
 apt-get -y autoremove
 
 mkdir -p /var/lib/inboxapp/parts
-chown $SUDO_UID:$SUDO_GID /var/lib/inboxapp
+chown -R $SUDO_UID:$SUDO_GID /var/lib/inboxapp
 
 mkdir -p /var/log/inboxapp
 chown $SUDO_UID:$SUDO_GID /var/log/inboxapp
