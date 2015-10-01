@@ -1,3 +1,4 @@
+import re
 import json
 
 import boto3
@@ -65,6 +66,11 @@ def get_doc_service():
         endpoint_url='https://{0}'.format(doc_service_url))
 
 
+def _strip_non_numeric(phone_number):
+    digits = [ch for ch in phone_number if re.match('[0-9]', ch)]
+    return ''.join(digits)
+
+
 def cloudsearch_contact_repr(contact):
     # strip display name out of email address
     parsed = address.parse(contact.email_address)
@@ -74,7 +80,8 @@ def cloudsearch_contact_repr(contact):
         'namespace_id': contact.namespace_id,
         'name': contact.name or '',
         'email_address': email_address,
-        'phone_numbers': [p.number for p in contact.phone_numbers]
+        'phone_numbers': [_strip_non_numeric(p.number)
+                          for p in contact.phone_numbers]
     }
 
 
@@ -218,18 +225,18 @@ def delete_namespace_indexes(namespace_ids):
         for namespace_id in namespace_ids:
             search_client = ContactSearchClient(namespace_id)
 
-            previous_records = search_client.fetch_all_matching_ids()
+            record_ids = search_client.fetch_all_matching_ids()
 
-            log.info("deleting all records",
+            log.info("deleting all record_ids",
                      namespace_id=namespace_id,
-                     total=len(previous_records),
-                     ids=previous_records)
+                     total=len(record_ids),
+                     ids=record_ids)
 
             # Keep upload under 5 MB if each delete doc is about 265 bytes.
             chunk_size = 18000
 
             docs = []
-            for id_ in previous_records:
+            for id_ in record_ids:
                 docs.append({'type': 'delete', 'id': id_})
 
                 if len(docs) > chunk_size:
