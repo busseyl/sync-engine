@@ -42,7 +42,7 @@ SYNC_MONITOR_CLS = 'GmailSyncMonitor'
 
 
 MAX_DOWNLOAD_BYTES = 2 ** 20
-MAX_DOWNLOAD_COUNT = 30
+MAX_DOWNLOAD_COUNT = 1
 
 
 class GmailSyncMonitor(ImapSyncMonitor):
