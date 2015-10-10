@@ -1,10 +1,9 @@
 import json
 import os
-import subprocess
 import uuid
 from datetime import datetime, timedelta
 from flanker import mime
-
+from inbox.util.testutils import setup_test_db
 from pytest import fixture, yield_fixture
 
 
@@ -33,24 +32,24 @@ def config():
 
 @fixture(scope='session')
 def dbloader(config):
-    return TestDB()
+    return setup_test_db()
 
 
 @yield_fixture(scope='function')
 def db(dbloader):
     from inbox.models.session import new_session
-    dbloader.session = new_session(dbloader.engine)
+    dbloader.session = new_session(dbloader)
     yield dbloader
     dbloader.session.close()
 
 
 @yield_fixture(scope='function')
-def empty_db(request, config):
+def empty_db(config):
     from inbox.models.session import new_session
-    testdb = TestDB()
-    testdb.session = new_session(testdb.engine)
-    yield testdb
-    testdb.session.close()
+    engine = setup_test_db()
+    engine.session = new_session(engine)
+    yield engine
+    engine.session.close()
 
 
 def mock_redis_client(*args, **kwargs):
@@ -86,28 +85,6 @@ class TestWebhooksClient(object):
     def post_data(self, path, data, headers=''):
         path = '/w' + path
         return self.client.post(path, data=json.dumps(data), headers=headers)
-
-
-class TestDB(object):
-    """
-    Creates a new, empty test database with table structure generated
-    from declarative model classes.
-
-    """
-    # STOPSHIP(emfree) hoist into module shareable with redwood.
-    def __init__(self):
-        from inbox.ignition import engine_manager
-        from inbox.ignition import init_db
-        # Set up test database
-        self.engine = engine_manager.get_for_id(0)
-        db_invocation = 'DROP DATABASE IF EXISTS test; ' \
-                        'CREATE DATABASE IF NOT EXISTS test ' \
-                        'DEFAULT CHARACTER SET utf8mb4 DEFAULT COLLATE ' \
-                        'utf8mb4_general_ci'
-
-        subprocess.check_call('mysql -uinboxtest -pinboxtest '
-                              '-e "{}"'.format(db_invocation), shell=True)
-        init_db(self.engine)
 
 
 @fixture
