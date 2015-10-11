@@ -32,34 +32,35 @@ def config():
 
 @fixture(scope='session')
 def dbloader(config):
-    return setup_test_db()
+    setup_test_db()
 
 
 @yield_fixture(scope='function')
 def db(dbloader):
+    from inbox.ignition import engine_manager
     from inbox.models.session import new_session
-    dbloader.session = new_session(dbloader)
-    yield dbloader
-    dbloader.session.close()
-
-
-@yield_fixture(scope='function')
-def empty_db(config):
-    from inbox.models.session import new_session
-    engine = setup_test_db()
+    engine = engine_manager.get_for_id(0)
+    # TODO(emfree): tests should really either instantiate their own sessions,
+    # or take a fixture that is itself a session.
     engine.session = new_session(engine)
     yield engine
     engine.session.close()
 
 
-def mock_redis_client(*args, **kwargs):
-    return None
+@yield_fixture(scope='function')
+def empty_db(config):
+    from inbox.ignition import engine_manager
+    from inbox.models.session import new_session
+    setup_test_db()
+    engine = engine_manager.get_for_id(0)
+    engine.session = new_session(engine)
+    yield engine
 
 
 @fixture(autouse=True)
 def mock_redis(monkeypatch):
     monkeypatch.setattr("inbox.heartbeat.store.HeartbeatStore.__init__",
-                        mock_redis_client)
+                        lambda *args, **kwargs: None)
 
 
 @yield_fixture

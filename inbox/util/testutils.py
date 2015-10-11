@@ -7,15 +7,20 @@ def setup_test_db():
     from declarative model classes; returns an engine for that database.
 
     """
+    from inbox.config import config
     from inbox.ignition import engine_manager
     from inbox.ignition import init_db
-    engine = engine_manager.get_for_id(0)
-    db_invocation = 'DROP DATABASE IF EXISTS test; ' \
-                    'CREATE DATABASE IF NOT EXISTS test ' \
-                    'DEFAULT CHARACTER SET utf8mb4 DEFAULT COLLATE ' \
-                    'utf8mb4_general_ci'
 
-    subprocess.check_call('mysql -uinboxtest -pinboxtest '
-                          '-e "{}"'.format(db_invocation), shell=True)
-    init_db(engine)
-    return engine
+    for name in ('test', 'test_1'):
+        cmd = 'DROP DATABASE IF EXISTS {name}; ' \
+              'CREATE DATABASE IF NOT EXISTS {name} ' \
+              'DEFAULT CHARACTER SET utf8mb4 DEFAULT COLLATE ' \
+              'utf8mb4_general_ci'.format(name=name)
+
+        subprocess.check_call('mysql -uinboxtest -pinboxtest '
+                              '-e "{}"'.format(cmd), shell=True)
+
+    database_params = config.get_required('DATABASES')
+    for key in sorted(database_params):
+        engine = engine_manager.engines[int(key)]
+        init_db(engine, int(key))

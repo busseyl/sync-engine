@@ -137,35 +137,9 @@ def session_scope(id_, versioned=True):
 
 @contextmanager
 def session_scope_by_shard_id(shard_id, versioned=True):
-    engine = engine_manager.get_for_shard_id(shard_id)
-    session = new_session(engine, versioned)
-
-    try:
-        if config.get('LOG_DB_SESSIONS'):
-            start_time = time.time()
-            calling_frame = sys._getframe().f_back.f_back
-            call_loc = '{}:{}'.format(calling_frame.f_globals.get('__name__'),
-                                      calling_frame.f_lineno)
-            logger = log.bind(engine_id=id(engine),
-                              session_id=id(session), call_loc=call_loc)
-            logger.info('creating db_session',
-                        sessions_used=engine.pool.checkedout())
-        yield session
-        session.commit()
-    except BaseException as exc:
-        try:
-            session.rollback()
-            raise
-        except OperationalError:
-            log.warn('Encountered OperationalError on rollback',
-                     original_exception=type(exc))
-            raise exc
-    finally:
-        if config.get('LOG_DB_SESSIONS'):
-            lifetime = time.time() - start_time
-            logger.info('closing db_session', lifetime=lifetime,
-                        sessions_used=engine.pool.checkedout())
-        session.close()
+    key = shard_id << 48
+    with session_scope(key, versioned) as db_session:
+        yield db_session
 
 # GLOBAL (cross-shard) queries. USE WITH CAUTION.
 
