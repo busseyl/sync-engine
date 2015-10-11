@@ -78,7 +78,8 @@ def account_or_none(cls, email_address):
 
 def commit_account(account):
     shards = config.get_required('DATABASES')
-    open_shards = [id_ for id_, params in shards.iteritems() if params['OPEN']]
+    open_shards = [int(id_) for id_, params in shards.iteritems()
+                   if params['OPEN']]
 
     # TODO[k]: Always pick min()instead?
     shard_id = random.choice(open_shards)
@@ -86,8 +87,7 @@ def commit_account(account):
     with session_scope_by_shard_id(shard_id) as db_session:
         db_session.add(account)
         db_session.commit()
-        db_session.expunge(account)
-    return account
+        return account.id
 
 
 class AuthHandler(object):
