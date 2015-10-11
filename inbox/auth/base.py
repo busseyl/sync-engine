@@ -1,11 +1,8 @@
-import random
 from abc import ABCMeta, abstractmethod
 
 from sqlalchemy.orm.exc import NoResultFound
 
-from inbox.config import config
-from inbox.models.session import (global_session_scope,
-                                  session_scope_by_shard_id)
+from inbox.models.session import global_session_scope
 from inbox.providers import providers
 from inbox.basicauth import NotSupportedError
 
@@ -74,20 +71,6 @@ def account_or_none(cls, email_address):
             return
         db_session.expunge(account)
     return account
-
-
-def commit_account(account):
-    shards = config.get_required('DATABASES')
-    open_shards = [int(id_) for id_, params in shards.iteritems()
-                   if params['OPEN']]
-
-    # TODO[k]: Always pick min()instead?
-    shard_id = random.choice(open_shards)
-
-    with session_scope_by_shard_id(shard_id) as db_session:
-        db_session.add(account)
-        db_session.commit()
-        return account.id
 
 
 class AuthHandler(object):
