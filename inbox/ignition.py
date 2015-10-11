@@ -65,13 +65,14 @@ def engine(database_name, database_uri, pool_size=DB_POOL_SIZE,
 
 
 class EngineManager(object):
-    def __init__(self, shard_params, username, password):
-        # TODO: username / password should be parametrizable by shard
+    def __init__(self, shard_params, users):
         self.engines = {}
         for key, params in shard_params.items():
             database_name = params['DATABASE_NAME']
             hostname = params['HOSTNAME']
             port = params['PORT']
+            username = users[key]['USER']
+            password = users[key]['PASSWORD']
             uri = build_uri(username=username,
                             password=password,
                             database_name=database_name,
@@ -90,8 +91,7 @@ class EngineManager(object):
 
 
 engine_manager = EngineManager(config.get_required('DATABASES'),
-                               config.get_required('MYSQL_USER'),
-                               config.get_required('MYSQL_PASSWORD'))
+                               config.get_required('DATABASE_USERS'))
 
 
 def init_db(engine, key=0):

@@ -109,8 +109,3 @@ config = Configuration()
 _update_config_from_env(config)
 _get_local_feature_flags(config)
 _get_process_name(config)
-
-if 'MYSQL_PASSWORD' not in config:
-    raise Exception(
-        'Missing secrets config file? Run `sudo cp etc/secrets-dev.yml '
-        '/etc/inboxapp/secrets.yml` and retry')

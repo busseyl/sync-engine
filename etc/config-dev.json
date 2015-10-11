@@ -1,8 +1,4 @@
 {
-"MYSQL_DATABASE": "inbox",
-"MYSQL_HOSTNAME": "localhost",
-"MYSQL_PORT": 3306,
-
 "DATABASES": {
     "0": {
         "DATABASE_NAME": "inbox",

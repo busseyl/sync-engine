@@ -17,10 +17,11 @@ from inbox.sqlalchemy_ext.util import ForceStrictMode
               help='Disable creating the test database for production '
                    'deployments')
 def main(prod):
-    mysql_user = config.get_required('MYSQL_USER')
-    mysql_password = config.get_required('MYSQL_PASSWORD')
     database_params = config.get_required('DATABASES')
+    database_users = config.get_required('DATABASE_USERS')
     for key, params in sorted(database_params.items()):
+        mysql_user = database_users[key]['USER']
+        mysql_password = database_users[key]['PASSWORD']
         base_uri = build_uri(username=mysql_user,
                              password=mysql_password,
                              hostname=params['HOSTNAME'],
