@@ -19,11 +19,6 @@
         "DATABASE_NAME": "inbox_3",
         "HOSTNAME": "localhost",
         "PORT": 3306
-    },
-    "4": {
-        "DATABASE_NAME": "inbox_4",
-        "HOSTNAME": "localhost",
-        "PORT": 3306
     }
 },
 
