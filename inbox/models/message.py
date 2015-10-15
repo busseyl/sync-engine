@@ -46,7 +46,7 @@ class Message(MailSyncBase, HasRevisions, HasPublicID):
         load_on_pending=True)
 
     # Do delete messages if their associated thread is deleted.
-    thread_id = Column(Integer, ForeignKey('thread.id', ondelete='CASCADE'),
+    thread_id = Column(ForeignKey('thread.id', ondelete='CASCADE'),
                        nullable=False)
     thread = relationship(
         'Thread',
@@ -149,8 +149,7 @@ class Message(MailSyncBase, HasRevisions, HasPublicID):
     # Whether this draft is a reply to an existing thread.
     is_reply = Column(Boolean)
 
-    reply_to_message_id = Column(Integer, ForeignKey('message.id'),
-                                 nullable=True)
+    reply_to_message_id = Column(ForeignKey('message.id'), nullable=True)
     reply_to_message = relationship('Message', uselist=False)
 
     def mark_for_deletion(self):
@@ -552,10 +551,14 @@ Index('ix_message_namespace_id_deleted_at', Message.namespace_id,
 Index('ix_message_namespace_id_is_created', Message.namespace_id,
       Message.is_created)
 
+Index('ix_message_namespace_id_message_id_header_subject',
+      Message.namespace_id, Message.subject, Message.message_id_header,
+      mysql_length={'subject': 191, 'message_id_header': 191})
+
 
 class MessageCategory(MailSyncBase):
     """ Mapping between messages and categories. """
-    message_id = Column(Integer, ForeignKey(Message.id, ondelete='CASCADE'),
+    message_id = Column(ForeignKey(Message.id, ondelete='CASCADE'),
                         nullable=False)
     message = relationship(
         'Message',
@@ -563,7 +566,7 @@ class MessageCategory(MailSyncBase):
                         collection_class=set,
                         cascade='all, delete-orphan'))
 
-    category_id = Column(Integer, ForeignKey(Category.id, ondelete='CASCADE'),
+    category_id = Column(ForeignKey(Category.id, ondelete='CASCADE'),
                          nullable=False)
     category = relationship(
         Category,

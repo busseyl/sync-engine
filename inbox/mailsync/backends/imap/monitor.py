@@ -47,7 +47,7 @@ class ImapSyncMonitor(BaseMailSyncMonitor):
         list of tuples (folder_name, folder_id) for each folder we want to sync
         (in order).
         """
-        with session_scope() as db_session:
+        with session_scope(self.namespace_id) as db_session:
             with connection_pool(self.account_id).get() as crispin_client:
                 # Get a fresh list of the folder names from the remote
                 remote_folders = crispin_client.folders()
@@ -138,6 +138,7 @@ class ImapSyncMonitor(BaseMailSyncMonitor):
                          folder_id=folder_id,
                          folder_name=folder_name)
                 thread = self.sync_engine_class(self.account_id,
+                                                self.namespace_id,
                                                 folder_name,
                                                 folder_id,
                                                 self.email_address,
@@ -173,7 +174,7 @@ class ImapSyncMonitor(BaseMailSyncMonitor):
             log.error(
                 'Error authenticating; stopping sync', exc_info=True,
                 account_id=self.account_id, logstash_tag='mark_invalid')
-            with session_scope() as db_session:
+            with session_scope(self.namespace_id) as db_session:
                 account = db_session.query(Account).get(self.account_id)
                 account.mark_invalid()
                 account.update_sync_error(str(exc))

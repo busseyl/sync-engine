@@ -38,6 +38,7 @@ from inbox.sendmail.base import (create_message_from_json, update_draft,
                                  delete_draft, create_draft_from_mime,
                                  SendMailException)
 from nylas.logging import get_logger
+from inbox.ignition import engine_manager
 from inbox.models.action_log import schedule_action
 from inbox.models.session import new_session, session_scope
 from inbox.search.base import get_search_client, SearchBackendException
@@ -47,8 +48,6 @@ from inbox.events.ical import (generate_icalendar_invite, send_invite,
                                generate_rsvp, send_rsvp)
 
 
-from inbox.ignition import main_engine
-engine = main_engine()
 log = get_logger()
 
 DEFAULT_LIMIT = 100
@@ -86,7 +85,7 @@ if config.get('DEBUG_PROFILING_ON'):
 @app.url_value_preprocessor
 def pull_lang_code(endpoint, values):
     if 'namespace_public_id' in values:
-        g.namespace_public_id = values.pop('namespace_public_id')
+        values.pop('namespace_public_id')
         g.legacy_nsid = True
     else:
         g.legacy_nsid = False
@@ -94,29 +93,17 @@ def pull_lang_code(endpoint, values):
 
 @app.before_request
 def start():
+    engine = engine_manager.get_for_id(g.namespace_id)
     g.db_session = new_session(engine)
-    try:
-        valid_public_id(g.namespace_public_id)
-        g.namespace = Namespace.from_public_id(g.namespace_public_id,
-                                               g.db_session)
-
-        g.encoder = APIEncoder(g.namespace.public_id,
-                               legacy_nsid=g.legacy_nsid)
-    except NoResultFound:
-        raise NotFoundError("Couldn't find namespace  `{0}` ".format(
-            g.namespace_public_id))
-
+    g.namespace = Namespace.get(g.namespace_id, g.db_session)
+    g.encoder = APIEncoder(g.namespace.public_id,
+                           legacy_nsid=g.legacy_nsid)
     g.log = log.new(endpoint=request.endpoint,
                     account_id=g.namespace.account_id)
-
     g.parser = reqparse.RequestParser(argument_class=ValidatableArgument)
     g.parser.add_argument('limit', default=DEFAULT_LIMIT, type=limit,
                           location='args')
     g.parser.add_argument('offset', default=0, type=offset, location='args')
-
-    if hasattr(g, 'namespace_public_id') and \
-            not g.namespace_public_id == g.namespace.public_id:
-        return err(404, "Unknown namespace ID")
 
 
 @app.after_request
@@ -1417,7 +1404,7 @@ def sync_deltas():
 
     start_time = time.time()
     while time.time() - start_time < timeout:
-        with session_scope() as db_session:
+        with session_scope(g.namespace.id) as db_session:
             deltas, _ = delta_sync.format_transactions_after_pointer(
                 g.namespace, start_pointer, db_session, args['limit'],
                 exclude_types, include_types, exclude_folders,

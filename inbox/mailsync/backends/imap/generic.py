@@ -106,10 +106,11 @@ FAST_REFRESH_INTERVAL = timedelta(seconds=30)
 
 class FolderSyncEngine(Greenlet):
     """Base class for a per-folder IMAP sync engine."""
-    def __init__(self, account_id, folder_name, folder_id, email_address,
-                 provider_name, syncmanager_lock):
+    def __init__(self, account_id, namespace_id, folder_name, folder_id,
+                 email_address, provider_name, syncmanager_lock):
         bind_context(self, 'foldersyncengine', account_id, folder_id)
         self.account_id = account_id
+        self.namespace_id = namespace_id
         self.folder_name = folder_name
         self.folder_id = folder_id
         if self.folder_name.lower() == 'inbox':
@@ -127,11 +128,7 @@ class FolderSyncEngine(Greenlet):
         self.is_first_sync = False
         self.is_first_message = False
 
-        with session_scope() as db_session:
-            account = Account.get(self.account_id, db_session)
-            self.namespace_id = account.namespace.id
-            assert self.namespace_id is not None, "namespace_id is None"
-
+        with session_scope(self.namespace_id) as db_session:
             folder = Folder.get(self.folder_id, db_session)
             if folder:
                 self.is_initial_sync = folder.initial_sync_end is None
@@ -197,7 +194,7 @@ class FolderSyncEngine(Greenlet):
                 log.error('Error authenticating; stopping sync', exc_info=True,
                           account_id=self.account_id, folder_id=self.folder_id,
                           logstash_tag='mark_invalid')
-                with session_scope() as db_session:
+                with session_scope(self.namespace_id) as db_session:
                     account = db_session.query(Account).get(self.account_id)
                     account.mark_invalid()
                     account.update_sync_error(str(exc))
@@ -207,13 +204,13 @@ class FolderSyncEngine(Greenlet):
             # killed between the end of the handler and the commit.
             if self.state != old_state:
                 # Don't need to re-query, will auto refresh on re-associate.
-                with session_scope() as db_session:
+                with session_scope(self.namespace_id) as db_session:
                     db_session.add(saved_folder_status)
                     saved_folder_status.state = self.state
                     db_session.commit()
 
     def _load_state(self):
-        with session_scope() as db_session:
+        with session_scope(self.namespace_id) as db_session:
             try:
                 state = ImapFolderSyncStatus.state
                 saved_folder_status = db_session.query(ImapFolderSyncStatus)\
@@ -239,12 +236,12 @@ class FolderSyncEngine(Greenlet):
         self.state = saved_folder_status.state
 
     def _report_initial_sync_start(self):
-        with session_scope() as db_session:
+        with session_scope(self.namespace_id) as db_session:
             q = db_session.query(Folder).get(self.folder_id)
             q.initial_sync_start = datetime.utcnow()
 
     def _report_initial_sync_end(self):
-        with session_scope() as db_session:
+        with session_scope(self.namespace_id) as db_session:
             q = db_session.query(Folder).get(self.folder_id)
             q.initial_sync_end = datetime.utcnow()
 
@@ -260,7 +257,7 @@ class FolderSyncEngine(Greenlet):
         with self.conn_pool.get() as crispin_client:
             crispin_client.select_folder(self.folder_name, uidvalidity_cb)
             # Ensure we have an ImapFolderInfo row created prior to sync start.
-            with session_scope() as db_session:
+            with session_scope(self.namespace_id) as db_session:
                 try:
                     db_session.query(ImapFolderInfo). \
                         filter(ImapFolderInfo.account_id == self.account_id,
@@ -304,7 +301,7 @@ class FolderSyncEngine(Greenlet):
             assert crispin_client.selected_folder_name == self.folder_name
             remote_uids = crispin_client.all_uids()
             with self.syncmanager_lock:
-                with session_scope() as db_session:
+                with session_scope(self.namespace_id) as db_session:
                     local_uids = common.local_uids(self.account_id, db_session,
                                                    self.folder_id)
                     common.remove_deleted_uids(
@@ -313,7 +310,7 @@ class FolderSyncEngine(Greenlet):
                         db_session)
 
             new_uids = set(remote_uids).difference(local_uids)
-            with session_scope() as db_session:
+            with session_scope(self.namespace_id) as db_session:
                 account = db_session.query(Account).get(self.account_id)
                 throttled = account.throttled
                 self.update_uid_counts(
@@ -399,7 +396,7 @@ class FolderSyncEngine(Greenlet):
         # and return to the 'initial' state to resync.
         # This will cause message and threads to be deleted and recreated, but
         # uidinvalidity is sufficiently rare that this tradeoff is acceptable.
-        with session_scope() as db_session:
+        with session_scope(self.namespace_id) as db_session:
             invalid_uids = {
                 uid for uid, in db_session.query(ImapUid.msg_uid).
                 filter_by(account_id=self.account_id,
@@ -498,7 +495,7 @@ class FolderSyncEngine(Greenlet):
 
         new_uids = set()
         with self.syncmanager_lock:
-            with session_scope() as db_session:
+            with session_scope(self.namespace_id) as db_session:
                 account = Account.get(self.account_id, db_session)
                 folder = Folder.get(self.folder_id, db_session)
                 for msg in raw_messages:
@@ -526,7 +523,7 @@ class FolderSyncEngine(Greenlet):
     def _report_first_message(self):
         now = datetime.utcnow()
 
-        with session_scope() as db_session:
+        with session_scope(self.namespace_id) as db_session:
             account = db_session.query(Account).get(self.account_id)
             account_created = account.created_at
 
@@ -583,7 +580,7 @@ class FolderSyncEngine(Greenlet):
                  remote_uidnext=remote_uidnext, saved_uidnext=self.uidnext)
 
         crispin_client.select_folder(self.folder_name, self.uidvalidity_cb)
-        with session_scope() as db_session:
+        with session_scope(self.namespace_id) as db_session:
             lastseenuid = common.lastseenuid(self.account_id, db_session,
                                              self.folder_id)
         latest_uids = crispin_client.conn.fetch('{}:*'.format(lastseenuid + 1),
@@ -619,7 +616,7 @@ class FolderSyncEngine(Greenlet):
         changed_flags = crispin_client.condstore_changed_flags(
             self.highestmodseq)
         remote_uids = crispin_client.all_uids()
-        with session_scope() as db_session:
+        with session_scope(self.namespace_id) as db_session:
             common.update_metadata(self.account_id, self.folder_id,
                                    changed_flags, db_session)
             local_uids = common.local_uids(self.account_id, db_session,
@@ -631,13 +628,13 @@ class FolderSyncEngine(Greenlet):
             # get_new_uids, save them first. We want to always have the
             # latest UIDs before expunging anything, in order to properly
             # capture draft revisions.
-            with session_scope() as db_session:
+            with session_scope(self.namespace_id) as db_session:
                 lastseenuid = common.lastseenuid(self.account_id, db_session,
                                                  self.folder_id)
             if remote_uids and lastseenuid < max(remote_uids):
                 log.info('Downloading new UIDs before expunging')
                 self.get_new_uids(crispin_client)
-            with session_scope() as db_session:
+            with session_scope(self.namespace_id) as db_session:
                 common.remove_deleted_uids(self.account_id, self.folder_id,
                                            expunged_uids, db_session)
                 db_session.commit()
@@ -662,7 +659,7 @@ class FolderSyncEngine(Greenlet):
 
     def refresh_flags_impl(self, crispin_client, max_uids):
         crispin_client.select_folder(self.folder_name, self.uidvalidity_cb)
-        with session_scope() as db_session:
+        with session_scope(self.namespace_id) as db_session:
             local_uids = common.local_uids(account_id=self.account_id,
                                            session=db_session,
                                            folder_id=self.folder_id,
@@ -670,7 +667,7 @@ class FolderSyncEngine(Greenlet):
 
         flags = crispin_client.flags(local_uids)
         expunged_uids = set(local_uids).difference(flags.keys())
-        with session_scope() as db_session:
+        with session_scope(self.namespace_id) as db_session:
             common.remove_deleted_uids(self.account_id, self.folder_id,
                                        expunged_uids, db_session)
             common.update_metadata(self.account_id, self.folder_id,
@@ -732,7 +729,7 @@ class FolderSyncEngine(Greenlet):
         self._update_imap_folder_info('highestmodseq', value)
 
     def _load_imap_folder_info(self):
-        with session_scope() as db_session:
+        with session_scope(self.namespace_id) as db_session:
             imapfolderinfo = db_session.query(ImapFolderInfo). \
                 filter(ImapFolderInfo.account_id == self.account_id,
                        ImapFolderInfo.folder_id == self.folder_id). \
@@ -741,7 +738,7 @@ class FolderSyncEngine(Greenlet):
             return imapfolderinfo
 
     def _update_imap_folder_info(self, attrname, value):
-        with session_scope() as db_session:
+        with session_scope(self.namespace_id) as db_session:
             imapfolderinfo = db_session.query(ImapFolderInfo). \
                 filter(ImapFolderInfo.account_id == self.account_id,
                        ImapFolderInfo.folder_id == self.folder_id). \
@@ -769,7 +766,7 @@ class FolderSyncEngine(Greenlet):
 def uidvalidity_cb(account_id, folder_name, select_info):
     assert folder_name is not None and select_info is not None, \
         "must start IMAP session before verifying UIDVALIDITY"
-    with session_scope() as db_session:
+    with session_scope(account_id) as db_session:
         saved_folder_info = common.get_folder_info(account_id, db_session,
                                                    folder_name)
         saved_uidvalidity = or_none(saved_folder_info, lambda i:

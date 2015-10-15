@@ -193,12 +193,6 @@ find . -name \*.pyc -delete
 color '35;1' 'Installing dependencies from pip...'
 SODIUM_INSTALL=system pip install -r requirements.txt
 
-pip install -e .
-if [ -d "../sync-engine-eas" ]; then
-    pip install -r ../sync-engine-eas/requirements.txt
-    pip install -e ../sync-engine-eas
-    python ../sync-engine-eas/bin/create-test-db
-fi
 color '35;1' 'Finished installing dependencies.'
 
 mkdir -p /etc/inboxapp
@@ -274,14 +268,8 @@ if ! $prod; then
     mysqld_safe &
     sleep 10
 
-    db_name=`cat /etc/inboxapp/config.json  | grep "MYSQL_DATABASE" | awk '{ print $2 }' | sed "s/\"\(.*\)\",/\1/"`
-    if ! have_dbs=$(mysql -e "show databases like '$db_name'" | grep -q $db_name); then
-        color '35;1' 'Creating databases...'
-        python bin/create-db
-    else
-        color '35;1' 'Upgrading databases...'
-        alembic upgrade head
-    fi
+    bin/create-db
+    bin/create-test-db
 fi
 
 if [[ $(mysql --version) != *"5.6"* ]]

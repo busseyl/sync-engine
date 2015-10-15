@@ -71,7 +71,8 @@ def _get_connection_pool(account_id, pool_size, pool_map, readonly):
     with _lock_map[account_id]:
         if account_id not in pool_map:
             pool_map[account_id] = CrispinConnectionPool(
-                account_id, num_connections=pool_size, readonly=readonly)
+                account_id, num_connections=pool_size,
+                readonly=readonly)
         return pool_map[account_id]
 
 
@@ -168,7 +169,7 @@ class CrispinConnectionPool(object):
             self._sem.release()
 
     def _set_account_info(self):
-        with session_scope() as db_session:
+        with session_scope(self.account_id) as db_session:
             account = db_session.query(ImapAccount).get(self.account_id)
             self.sync_state = account.sync_state
             self.provider = account.provider
@@ -182,7 +183,7 @@ class CrispinConnectionPool(object):
 
     def _new_raw_connection(self):
         """Returns a new, authenticated IMAPClient instance for the account."""
-        with session_scope() as db_session:
+        with session_scope(self.account_id) as db_session:
             if self.provider == 'gmail':
                 account = db_session.query(GmailAccount).options(
                     joinedload(GmailAccount.auth_credentials)).get(
@@ -680,7 +681,6 @@ class CrispinClient(object):
         """Idle for up to `timeout` seconds. Make sure we take the connection
         back out of idle mode so that we can reuse this connection in another
         context."""
-        log.info('Idling', timeout=timeout)
         self.conn.idle()
         try:
             with self._restore_timeout():
