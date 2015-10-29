@@ -15,7 +15,8 @@ from sqlalchemy.orm import joinedload
 from nylas.logging import get_logger
 log = get_logger()
 
-CLOUDSEARCH_DOMAIN = config.get('CLOUDSEARCH_DOMAIN')
+# Rate-limiting in domain discovery is breaking API.
+CLOUDSEARCH_DOMAIN = None # config.get('CLOUDSEARCH_DOMAIN')
 
 # CloudSearch charges per 1000 batched uploads. Batches must be
 # < 5 MB. This assumes that individual items are <= 1kb each.
