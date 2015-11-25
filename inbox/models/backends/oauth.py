@@ -14,7 +14,6 @@ log = get_logger()
 
 
 class TokenManager(object):
-
     def __init__(self):
         self._tokens = {}
 
@@ -39,7 +38,6 @@ token_manager = TokenManager()
 
 class OAuthAccount(object):
     # Secret
-
     @declared_attr
     def refresh_token_id(cls):
         return Column(ForeignKey(Secret.id), nullable=False)

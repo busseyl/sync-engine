@@ -10,7 +10,6 @@ def get_search_client(account):
 class SearchBackendException(Exception):
     """Raised if there's an error proxying the search request to the
     provider."""
-
     def __init__(self, message, http_code, server_error=None):
         self.message = message
         self.http_code = http_code

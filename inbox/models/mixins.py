@@ -81,7 +81,6 @@ class HasPublicID(object):
 
 
 class AddressComparator(Comparator):
-
     def __eq__(self, other):
         return self.__clause_element__() == canonicalize_address(other)
 
@@ -90,7 +89,6 @@ class AddressComparator(Comparator):
 
 
 class CaseInsensitiveComparator(Comparator):
-
     def __eq__(self, other):
         return func.lower(self.__clause_element__()) == func.lower(other)
 

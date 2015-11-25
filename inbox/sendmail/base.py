@@ -28,7 +28,6 @@ class SendMailException(Exception):
         If sending only failed for some recipients, information on the specific
         failures.
     """
-
     def __init__(self, message, http_code, server_error=None, failures=None):
         self.message = message
         self.http_code = http_code
@@ -64,7 +63,7 @@ def create_draft_from_mime(account, raw_mime, db_session):
             raise InputError("reply_to field can have at most one item")
 
         if msg.subject is not None and not \
-                isinstance(msg.subject, basestring):
+                                        isinstance(msg.subject, basestring):
             raise InputError('"subject" should be a string')
 
         if not isinstance(msg.body, basestring):

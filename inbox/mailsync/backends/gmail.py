@@ -48,7 +48,6 @@ MAX_DOWNLOAD_COUNT = 1
 
 
 class GmailSyncMonitor(ImapSyncMonitor):
-
     def __init__(self, *args, **kwargs):
         ImapSyncMonitor.__init__(self, *args, **kwargs)
         self.sync_engine_class = GmailFolderSyncEngine
@@ -74,12 +73,6 @@ class GmailSyncMonitor(ImapSyncMonitor):
         """
         account = db_session.query(Account).get(self.account_id)
 
-        old_labels = {label for label in db_session.query(Label).filter(
-            Label.account_id == self.account_id,
-            Label.deleted_at == None)}
-
-        new_labels = set()
-
         # Create new labels, folders
         for raw_folder in raw_folders:
             if raw_folder.role == 'starred':
@@ -87,18 +80,9 @@ class GmailSyncMonitor(ImapSyncMonitor):
                 # (we set Message.is_starred from the '\\Flagged' flag)
                 continue
 
-            label = Label.find_or_create(db_session, account,
-                                         raw_folder.display_name,
-                                         raw_folder.role)
-            new_labels.add(label)
-
-            if label.deleted_at is not None:
-                # This is a label which was previously marked as deleted
-                # but which mysteriously reappeared. Unmark it.
-                log.info('Deleted label recreated on remote',
-                         name=raw_folder.display_name)
-                label.deleted_at = None
-                label.category.deleted_at = None
+            Label.find_or_create(db_session, account,
+                                 raw_folder.display_name,
+                                 raw_folder.role)
 
             if raw_folder.role in ('all', 'spam', 'trash'):
                 folder = db_session.query(Folder).filter(
@@ -116,7 +100,7 @@ class GmailSyncMonitor(ImapSyncMonitor):
                     if folder.category:
                         if folder.category.display_name != \
                                 raw_folder.display_name:
-                            folder.category.display_name = raw_folder.display_name  # noqa
+                            folder.category.display_name = raw_folder.display_name
                     else:
                         log.info('Creating category for folder',
                                  account_id=self.account_id,
@@ -137,23 +121,10 @@ class GmailSyncMonitor(ImapSyncMonitor):
         for folder in account.folders:
             if folder.imapsyncstatus:
                 folder.imapsyncstatus.sync_should_run = True
-
-        # Go through the labels which have been "deleted" (i.e: they don't
-        # show up when running LIST) and mark them as such.
-        # We can't delete labels directly because Gmail allows users to hide
-        # folders --- we need to check that there's no messages still
-        # associated with the label.
-        deleted_labels = old_labels - new_labels
-        for deleted_label in deleted_labels:
-            deleted_label.deleted_at = datetime.now()
-            cat = deleted_label.category
-            cat.deleted_at = datetime.now()
-
         db_session.commit()
 
 
 class GmailFolderSyncEngine(FolderSyncEngine):
-
     def __init__(self, *args, **kwargs):
         FolderSyncEngine.__init__(self, *args, **kwargs)
         self.saved_uids = set()
@@ -194,16 +165,15 @@ class GmailFolderSyncEngine(FolderSyncEngine):
                 # Prioritize UIDs for messages in the inbox folder.
                 if len(remote_uids) < 1e6:
                     inbox_uids = set(
-                        crispin_client.search_uids(['X-GM-LABELS', 'inbox']))
+                        crispin_client.search_uids(['X-GM-LABELS inbox']))
                 else:
                     # The search above is really slow (times out) on really
                     # large mailboxes, so bound the search to messages within
                     # the past month in order to get anywhere.
-                    since = datetime.utcnow() - timedelta(days=30)
-                    inbox_uids = set(crispin_client.search_uids([
-                        'X-GM-LABELS', 'inbox',
-                        'SINCE', since]))
-
+                    since = (datetime.utcnow() - timedelta(days=30)). \
+                        strftime('%d-%b-%Y')
+                    inbox_uids = set(crispin_client.search_uids(
+                        ['X-GM-LABELS inbox', 'SINCE {}'.format(since)]))
                 uids_to_download = (sorted(unknown_uids - inbox_uids) +
                                     sorted(unknown_uids & inbox_uids))
             else:

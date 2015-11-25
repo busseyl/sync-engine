@@ -39,7 +39,6 @@ class ContactSync(BaseSyncMonitor):
         Logging handler.
 
     """
-
     def __init__(self, email_address, provider_name, account_id, namespace_id,
                  poll_frequency=300):
         bind_context(self, 'contactsync', account_id)

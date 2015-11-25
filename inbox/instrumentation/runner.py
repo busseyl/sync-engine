@@ -6,7 +6,6 @@ from pympler import muppy, summary
 
 
 class MetricsRunner():
-
     def __init__(self, port, trace_greenlets, profile_cpu):
         self.port = port
         self.trace_greenlets = trace_greenlets
@@ -59,7 +58,6 @@ class MetricsRunner():
 
 
 class _QuietHandler(WSGIRequestHandler):
-
     def log_request(self, *args, **kwargs):
         """Suppress request logging so as not to pollute application logs."""
         pass

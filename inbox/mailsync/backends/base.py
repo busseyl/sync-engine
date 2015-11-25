@@ -62,7 +62,6 @@ class BaseMailSyncMonitor(Greenlet):
     heartbeat : int
         How often to check for commands.
     """
-
     def __init__(self, account, heartbeat=1):
         bind_context(self, 'mailsyncmonitor', account.id)
         self.shutdown = event.Event()
