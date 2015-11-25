@@ -8,11 +8,13 @@ from imapclient import IMAPClient
 from nylas.logging import get_logger
 log = get_logger()
 from inbox.auth.base import AuthHandler
+from inbox.auth.generic import create_imap_connection
 from inbox.basicauth import ConnectionError, OAuthError
 from inbox.models.backends.oauth import token_manager
 
 
 class OAuthAuthHandler(AuthHandler):
+
     def connect_account(self, account):
         """
         Returns an authenticated IMAP connection for the given account.
@@ -35,7 +37,7 @@ class OAuthAuthHandler(AuthHandler):
     def _get_IMAP_connection(self, account):
         host, port = account.imap_endpoint
         try:
-            conn = IMAPClient(host, port=port, use_uid=True, ssl=True)
+            conn = create_imap_connection(host, port)
         except (IMAPClient.Error, socket.error) as exc:
             log.error('Error instantiating IMAP connection',
                       account_id=account.id,
@@ -170,6 +172,7 @@ class OAuthAuthHandler(AuthHandler):
 
 class OAuthRequestsWrapper(requests.auth.AuthBase):
     """Helper class for setting the Authorization header on HTTP requests."""
+
     def __init__(self, token):
         self.token = token
 

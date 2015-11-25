@@ -26,6 +26,7 @@ from email.parser import HeaderParser
 from collections import namedtuple, defaultdict
 
 import gevent
+from backports import ssl
 from gevent import socket
 from gevent.lock import BoundedSemaphore
 from gevent.queue import Queue
@@ -59,8 +60,21 @@ RawFolder = namedtuple('RawFolder', 'display_name role')
 # connection pools for a given account.
 _lock_map = defaultdict(threading.Lock)
 
+# Exception classes which indicate the network connection to the IMAP
+# server is broken.
+CONN_NETWORK_EXC_CLASSES = (socket.error, ssl.SSLError)
 
-CONN_DISCARD_EXC_CLASSES = (socket.error, imaplib.IMAP4.error)
+# Exception classes on which operations should be retried.
+CONN_RETRY_EXC_CLASSES = CONN_NETWORK_EXC_CLASSES + (imaplib.IMAP4.error,)
+
+# Exception classes on which connections should be discarded.
+CONN_DISCARD_EXC_CLASSES = CONN_NETWORK_EXC_CLASSES +  \
+                           (ssl.CertificateError, imaplib.IMAP4.error)
+
+# Exception classes which indicate the IMAP connection has become
+# unusable.
+CONN_UNUSABLE_EXC_CLASSES = CONN_NETWORK_EXC_CLASSES + \
+                            (ssl.CertificateError, imaplib.IMAP4.abort)
 
 
 class FolderMissingError(Exception):
@@ -120,6 +134,7 @@ class CrispinConnectionPool(object):
     readonly : bool
         Is the connection to the IMAP server read-only?
     """
+
     def __init__(self, account_id, num_connections, readonly):
         log.info('Creating Crispin connection pool for account {} with {} '
                  'connections'.format(account_id, num_connections))
@@ -154,8 +169,8 @@ class CrispinConnectionPool(object):
             # thing to do.
             log.info('IMAP connection error; discarding connection',
                      exc_info=True)
-            if (client is not None and not
-                    isinstance(exc, (imaplib.IMAP4.abort, socket.error))):
+            if client is not None and \
+               not isinstance(exc, CONN_UNUSABLE_EXC_CLASSES):
                 try:
                     client.logout()
                 except Exception:
@@ -209,7 +224,7 @@ def _exc_callback():
 
 
 retry_crispin = functools.partial(
-    retry, retry_classes=CONN_DISCARD_EXC_CLASSES, exc_callback=_exc_callback)
+    retry, retry_classes=CONN_RETRY_EXC_CLASSES, exc_callback=_exc_callback)
 
 
 class CrispinClient(object):
@@ -246,6 +261,7 @@ class CrispinClient(object):
         Whether or not to open IMAP connections as readonly.
 
     """
+
     def __init__(self, account_id, provider_info, email_address, conn,
                  readonly=True):
         self.account_id = account_id
@@ -306,7 +322,7 @@ class CrispinClient(object):
             # want to make sure we keep track of different providers'
             # "nonexistent" messages, so log this event.
             log.error("IMAPClient error selecting folder. May be deleted",
-                           error=str(e))
+                      error=str(e))
             raise
 
         select_info['UIDVALIDITY'] = long(select_info['UIDVALIDITY'])
@@ -330,6 +346,13 @@ class CrispinClient(object):
     @property
     def selected_uidnext(self):
         return or_none(self.selected_folder_info, lambda i: i.get('UIDNEXT'))
+
+    @property
+    def folder_delimiter(self):
+        folders = self._fetch_folder_list()
+        _, delimiter, __ = folders[0]
+
+        return delimiter
 
     def sync_folders(self):
         """
@@ -505,9 +528,9 @@ class CrispinClient(object):
 
         elapsed = time.time() - t
         log.debug('Requested all UIDs',
-                   selected_folder=self.selected_folder_name,
-                   search_time=elapsed,
-                   total_uids=len(fetch_result))
+                  selected_folder=self.selected_folder_name,
+                  search_time=elapsed,
+                  total_uids=len(fetch_result))
         return sorted([long(uid) for uid in fetch_result])
 
     def uids(self, uids):
@@ -934,13 +957,12 @@ class GmailCrispinClient(CrispinClient):
         list
         """
         uids = [long(uid) for uid in
-                self.conn.search('X-GM-THRID {}'.format(g_thrid))]
+                self.conn.search(['X-GM-THRID', g_thrid])]
         # UIDs ascend over time; return in order most-recent first
         return sorted(uids, reverse=True)
 
     def find_by_header(self, header_name, header_value):
-        criteria = ['HEADER {} {}'.format(header_name, header_value)]
-        return self.conn.search(criteria)
+        return self.conn.search(['HEADER', header_name, header_value])
 
     def _decode_labels(self, labels):
         return map(imapclient.imap_utf7.decode, labels)

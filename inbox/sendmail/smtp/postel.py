@@ -1,13 +1,10 @@
 import re
 import ssl
-import sys
 import base64
 import socket
 import itertools
 
 import smtplib
-
-import requests
 
 from nylas.logging import get_logger
 log = get_logger()
@@ -41,6 +38,7 @@ SMTP_TEMP_AUTH_FAIL_CODES = (421, 454)
 
 
 class _TokenManagerWrapper:
+
     def get_token(self, account, force_refresh=False):
         if account.provider == 'gmail':
             return g_token_manager.get_token_for_email(
@@ -53,50 +51,10 @@ class _TokenManagerWrapper:
 token_manager = _TokenManagerWrapper()
 
 
-def ssl_wrap_socket(sock, server_hostname):
-    """ SSL-enable the given socket, requiring valid certs (incl. hostnames).
-
-    Supports certificate verification and hostname-checking on Python 2.7.x,
-    as well as SNI on 2.7.9.
+class SMTP_SSL(smtplib.SMTP_SSL):
     """
-    try:
-        # In Python 2.7.9, this context sets good options (disabling buggy
-        # versions of the SSL protocol, etc.), requires a valid certificate,
-        # and verifies hostnames match. Supports SNI.
-        context = ssl.create_default_context()
-        return context.wrap_socket(sock, server_hostname=server_hostname)
-    except AttributeError:
-        # All previous versions: requires a valid certificate and verifies
-        # hostnames match, but does not support SNI. SSL options subject to
-        # whichever version of Python being run on, as SSL Contexts weren't
-        # added until 2.7.9.
-        #
-        # Using requests' CA bundle liberates us from the woes of having to
-        # figure out where the system CA bundle is.
-        return ssl.wrap_socket(sock,
-                               cert_reqs=ssl.CERT_REQUIRED,
-                               ca_certs=requests.certs.where())
-
-
-class SMTP_SSL_VerifyCerts(smtplib.SMTP_SSL):
-    """ Derived class which connects via SSL (not starttls) and actually
-        verifies SSL certificates on Python 2.
+        Derived class which correctly surfaces SMTP errors.
     """
-    def connect(self, host, port):
-        self._server_hostname = host
-        smtplib.SMTP_SSL.connect(self, host, port)
-
-    def _get_socket(self, host, port, timeout):
-        """ Code copied directly from Python 2.7.(3-9) (same code) with
-            modifications to verify certificates.
-        """
-        if self.debuglevel > 0:
-            print>>sys.stderr, 'connect:', (host, port)
-        new_socket = socket.create_connection((host, port), timeout)
-        new_socket = ssl_wrap_socket(new_socket,
-                                     server_hostname=self._server_hostname)
-        self.file = smtplib.SSLFakeFile(new_socket)
-        return new_socket
 
     def rset(self):
         """Wrap rset() in order to correctly surface SMTP exceptions.
@@ -119,35 +77,10 @@ class SMTP_SSL_VerifyCerts(smtplib.SMTP_SSL):
             log.warning('Server disconnect during SMTP rset', exc_info=True)
 
 
-class SMTP_VerifyCerts(smtplib.SMTP):
-    """ Derived class which connects via starttls and actually
-        verifies SSL certificates on Python 2.
+class SMTP(smtplib.SMTP):
     """
-    def connect(self, host, port):
-        self._server_hostname = host
-        smtplib.SMTP.connect(self, host, port)
-
-    def starttls(self):
-        """ Code copied directly from Python 2.7.(3-9) (same code) with
-            modifications to verify certificates.
-        """
-        self.ehlo_or_helo_if_needed()
-        if not self.has_extn("starttls"):
-            raise smtplib.SMTPException(
-                "STARTTLS extension not supported by server.")
-        (resp, reply) = self.docmd("STARTTLS")
-        if resp == 220:
-            self.sock = ssl_wrap_socket(self.sock, self._server_hostname)
-            self.file = smtplib.SSLFakeFile(self.sock)
-            # RFC 3207:
-            # The client MUST discard any knowledge obtained from
-            # the server, such as the list of SMTP service extensions,
-            # which was not obtained from the TLS negotiation itself.
-            self.helo_resp = None
-            self.ehlo_resp = None
-            self.esmtp_features = {}
-            self.does_esmtp = 0
-        return (resp, reply)
+        Derived class which correctly surfaces SMTP errors.
+    """
 
     def rset(self):
         """Wrap rset() in order to correctly surface SMTP exceptions.
@@ -173,7 +106,7 @@ class SMTP_VerifyCerts(smtplib.SMTP):
 def _transform_ssl_error(strerror):
     """ Clean up errors like:
 
-    _ssl.c:510: error:14090086:SSL routines:SSL3_GET_SERVER_CERTIFICATE:certificate verify failed
+    _ssl.c:510: error:14090086:SSL routines:SSL3_GET_SERVER_CERTIFICATE:certificate verify failed  # noqa
     """
     if strerror.endswith('certificate verify failed'):
         return 'SMTP server SSL certificate verify failed'
@@ -182,6 +115,7 @@ def _transform_ssl_error(strerror):
 
 
 class SMTPConnection(object):
+
     def __init__(self, account_id, email_address, auth_type,
                  auth_token, smtp_endpoint, log):
         self.account_id = account_id
@@ -216,10 +150,10 @@ class SMTPConnection(object):
     def setup(self):
         host, port = self.smtp_endpoint
         if port in (SMTP_OVER_SSL_PORT, SMTP_OVER_SSL_TEST_PORT):
-            self.connection = SMTP_SSL_VerifyCerts(timeout=SMTP_TIMEOUT)
+            self.connection = SMTP_SSL(timeout=SMTP_TIMEOUT)
             self._connect(host, port)
         else:
-            self.connection = SMTP_VerifyCerts(timeout=SMTP_TIMEOUT)
+            self.connection = SMTP(timeout=SMTP_TIMEOUT)
             self._connect(host, port)
             # Put the SMTP connection in TLS mode
             self.connection.ehlo()
@@ -298,16 +232,19 @@ class SMTPConnection(object):
 
     def sendmail(self, recipients, msg):
         try:
-            return self.connection.sendmail(self.email_address, recipients, msg)
+            return self.connection.sendmail(
+                self.email_address, recipients, msg)
         except UnicodeEncodeError:
             self.log.error('Unicode error when trying to decode email',
                            logstash_tag='sendmail_encode_error',
                            email=self.email_address, recipients=recipients)
-            raise SendMailException('Invalid character in recipient address', 402)
+            raise SendMailException(
+                'Invalid character in recipient address', 402)
 
 
 class SMTPClient(object):
     """ SMTPClient for Gmail and other IMAP providers. """
+
     def __init__(self, account):
         self.account_id = account.id
         self.log = get_logger()
