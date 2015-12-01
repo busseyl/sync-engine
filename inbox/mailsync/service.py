@@ -32,6 +32,7 @@ class SyncService(object):
     poll_interval : int
         Seconds between polls for account changes.
     """
+
     def __init__(self, cpu_id, total_cpus, poll_interval=10):
         self.keep_running = True
         self.host = platform.node()
@@ -65,7 +66,7 @@ class SyncService(object):
                 # shard without properly allocating sync hosts to it, accounts
                 # on it will still be started.
                 self.sync_hosts_for_shards[shard['ID']] = shard.get(
-                    'SYNC_HOSTS', [self.host])
+                    'SYNC_HOSTS') or [self.host]
 
     def run(self):
         if config.get('DEBUG_CONSOLE_ON'):

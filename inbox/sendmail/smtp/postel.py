@@ -38,6 +38,7 @@ SMTP_TEMP_AUTH_FAIL_CODES = (421, 454)
 
 
 class _TokenManagerWrapper:
+
     def get_token(self, account, force_refresh=False):
         if account.provider == 'gmail':
             return g_token_manager.get_token_for_email(
@@ -105,7 +106,7 @@ class SMTP(smtplib.SMTP):
 def _transform_ssl_error(strerror):
     """ Clean up errors like:
 
-    _ssl.c:510: error:14090086:SSL routines:SSL3_GET_SERVER_CERTIFICATE:certificate verify failed
+    _ssl.c:510: error:14090086:SSL routines:SSL3_GET_SERVER_CERTIFICATE:certificate verify failed  # noqa
     """
     if strerror.endswith('certificate verify failed'):
         return 'SMTP server SSL certificate verify failed'
@@ -114,6 +115,7 @@ def _transform_ssl_error(strerror):
 
 
 class SMTPConnection(object):
+
     def __init__(self, account_id, email_address, auth_type,
                  auth_token, smtp_endpoint, log):
         self.account_id = account_id
@@ -230,16 +232,19 @@ class SMTPConnection(object):
 
     def sendmail(self, recipients, msg):
         try:
-            return self.connection.sendmail(self.email_address, recipients, msg)
+            return self.connection.sendmail(
+                self.email_address, recipients, msg)
         except UnicodeEncodeError:
             self.log.error('Unicode error when trying to decode email',
                            logstash_tag='sendmail_encode_error',
                            email=self.email_address, recipients=recipients)
-            raise SendMailException('Invalid character in recipient address', 402)
+            raise SendMailException(
+                'Invalid character in recipient address', 402)
 
 
 class SMTPClient(object):
     """ SMTPClient for Gmail and other IMAP providers. """
+
     def __init__(self, account):
         self.account_id = account.id
         self.log = get_logger()
