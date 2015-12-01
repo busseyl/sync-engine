@@ -8,8 +8,9 @@ import gevent
 
 from tests.util.base import default_account
 from tests.api.base import api_client, new_api_client
+from tests.api_legacy.base import api_client as api_legacy_client
 
-__all__ = ['api_client', 'default_account']
+__all__ = ['api_client', 'api_legacy_client', 'default_account']
 
 SELF_SIGNED_CERTFILE = 'tests/data/self_signed_cert.pem'
 SELF_SIGNED_KEYFILE = 'tests/data/self_signed_cert.key'
