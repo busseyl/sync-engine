@@ -304,7 +304,7 @@ def noop_event_update(event, data):
 
 def valid_delta_object_types(types_arg):
     types = [item.strip() for item in types_arg.split(',')]
-    allowed_types = ('contact', 'message', 'event', 'file',
+    allowed_types = ('contact', 'message', 'event', 'file', 'tag',
                      'thread', 'calendar', 'draft', 'folder', 'label')
     for type_ in types:
         if type_ not in allowed_types:
