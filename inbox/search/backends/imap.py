@@ -33,7 +33,6 @@ class IMAPSearchClient(object):
             self.log.warn('Account provider not supported',
                           provider=account.provider)
             raise
-
         self.crispin_client = CrispinClient(self.account_id,
                                             acct_provider_info,
                                             account.email_address,

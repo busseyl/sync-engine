@@ -514,7 +514,6 @@ class FolderSyncEngine(Greenlet):
         if self.state == 'initial' and len(new_uids):
             self._report_message_velocity(datetime.utcnow() - start,
                                           len(new_uids))
-
         if self.is_first_message:
             self._report_first_message()
             self.is_first_message = False
