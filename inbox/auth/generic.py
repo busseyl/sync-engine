@@ -45,8 +45,6 @@ class GenericAuthHandler(AuthHandler):
         account.date = datetime.datetime.utcnow()
         account.provider = self.provider_name
         if self.provider_name == 'custom':
-            # Overwrite account.provider and set IMAP/SMTP endpoints.
-            account.provider = 'imap'
             account.imap_endpoint = (response['imap_server_host'],
                                      response['imap_server_port'])
             account.smtp_endpoint = (response['smtp_server_host'],

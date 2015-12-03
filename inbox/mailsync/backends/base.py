@@ -72,7 +72,7 @@ class BaseMailSyncMonitor(Greenlet):
         self.account_id = account.id
         self.namespace_id = account.namespace.id
         self.email_address = account.email_address
-        self.provider_name = account.provider
+        self.provider_name = account.verbose_provider
 
         Greenlet.__init__(self)
 
