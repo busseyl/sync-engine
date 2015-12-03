@@ -61,8 +61,8 @@ class BaseMailSyncMonitor(Greenlet):
         Provider for `account_id`.
     heartbeat : int
         How often to check for commands.
-    """
 
+    """
     def __init__(self, account, heartbeat=1):
         bind_context(self, 'mailsyncmonitor', account.id)
         self.shutdown = event.Event()
@@ -78,11 +78,13 @@ class BaseMailSyncMonitor(Greenlet):
 
     def _run(self):
         return retry_with_logging(self._run_impl, account_id=self.account_id,
-                                  logger=self.log)
+                                  provider=self.provider_name, logger=self.log)
 
     def _run_impl(self):
         sync = Greenlet(retry_with_logging, self.sync,
-                        account_id=self.account_id, logger=self.log)
+                        account_id=self.account_id,
+                        provider=self.provider_name,
+                        logger=self.log)
         sync.start()
 
         while not sync.ready():

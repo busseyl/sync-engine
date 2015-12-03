@@ -21,7 +21,6 @@ _ossl = ssl.ossl
 
 
 class GenericAuthHandler(AuthHandler):
-
     def get_account(self, target, email_address, response):
         account = account_or_none(target, GenericAccount, email_address)
         if not account:
@@ -44,9 +43,10 @@ class GenericAuthHandler(AuthHandler):
             account.name = response['name']
         account.password = response['password']
         account.date = datetime.datetime.utcnow()
-        provider_name = self.provider_name
-        account.provider = provider_name
-        if provider_name == 'custom':
+        account.provider = self.provider_name
+        if self.provider_name == 'custom':
+            # Overwrite account.provider and set IMAP/SMTP endpoints.
+            account.provider = 'imap'
             account.imap_endpoint = (response['imap_server_host'],
                                      response['imap_server_port'])
             account.smtp_endpoint = (response['smtp_server_host'],

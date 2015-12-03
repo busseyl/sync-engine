@@ -10,7 +10,6 @@ PROVIDER = 'generic'
 class GenericAccount(ImapAccount):
     id = Column(ForeignKey(ImapAccount.id, ondelete='CASCADE'),
                 primary_key=True)
-
     provider = Column(String(64))
     supports_condstore = Column(Boolean)
 
