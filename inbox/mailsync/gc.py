@@ -1,15 +1,20 @@
-import gevent
 import datetime
-from sqlalchemy import func
+from imapclient.imap_utf7 import encode as utf7_encode
+
+import gevent
+
 from nylas.logging import get_logger
+log = get_logger()
 from inbox.models import Message
 from inbox.models.category import Category
 from inbox.models.message import MessageCategory
+from inbox.models.folder import Folder
 from inbox.models.session import session_scope
 from inbox.util.concurrency import retry_with_logging
+from inbox.mailsync.backends.imap import common
 from inbox.util.debug import bind_context
-
-log = get_logger()
+from inbox.mailsync.backends.imap.generic import uidvalidity_cb
+from inbox.crispin import connection_pool
 
 DEFAULT_MESSAGE_TTL = 120
 MAX_FETCH = 1000
@@ -38,8 +43,8 @@ class DeleteHandler(gevent.Greenlet):
         `uid_accessor=lambda m: m.imapuids`
     message_ttl: int
         Number of seconds to wait after a message is marked for deletion before
-
         deleting it for good.
+
     """
 
     def __init__(self, account_id, namespace_id, uid_accessor,
@@ -126,10 +131,61 @@ class DeleteHandler(gevent.Greenlet):
             for cat in cats:
                 # Check if no message is associated with the category. If yes,
                 # delete it.
-                count = db_session.query(func.count(MessageCategory.id)).filter(
-                    MessageCategory.category_id == cat.id).scalar()
+                qu = db_session.query(MessageCategory).filter(
+                    MessageCategory.category_id == cat.id)
 
-                if count == 0:
+                if qu.count() == 0:
                     db_session.delete(cat)
+                    db_session.commit()
 
-                db_session.commit()
+
+class LabelRenameHandler(gevent.Greenlet):
+    """
+    Gmail has a long-standing bug where it won't notify us
+    of a label rename (https://stackoverflow.com/questions/19571456/how-imap-client-can-detact-gmail-label-rename-programmatically).
+
+    Because of this, we manually refresh the labels for all the UIDs in
+    this label. To do this, we select all the folders we sync and run a search
+    for the uids holding the new label.
+
+    This isn't elegant but it beats having to issue a complex query to the db.
+
+    """
+    def __init__(self, account_id, namespace_id, label_name,
+                 message_ttl=DEFAULT_MESSAGE_TTL):
+        bind_context(self, 'renamehandler', account_id)
+        self.account_id = account_id
+        self.namespace_id = namespace_id
+        self.label_name = label_name
+        self.log = log.new(account_id=account_id)
+        gevent.Greenlet.__init__(self)
+
+    def _run(self):
+        return retry_with_logging(self._run_impl, account_id=self.account_id)
+
+    def _run_impl(self):
+        self.log.info('Starting LabelRenameHandler',
+                      label_name=self.label_name)
+
+        with connection_pool(self.account_id).get() as crispin_client:
+            folder_names = []
+            with session_scope(self.account_id) as db_session:
+                folders = db_session.query(Folder).filter(
+                    Folder.account_id == self.account_id)
+
+                folder_names = [folder.name for folder in folders]
+                db_session.expunge_all()
+
+            for folder_name in folder_names:
+                crispin_client.select_folder(folder_name, uidvalidity_cb)
+
+                found_uids = crispin_client.search_uids(
+                    ['X-GM-LABELS', utf7_encode(self.label_name)])
+                flags = crispin_client.flags(found_uids)
+
+                self.log.info('Running metadata update for folder',
+                              folder_name=folder_name)
+                with session_scope(self.account_id) as db_session:
+                    common.update_metadata(self.account_id, folder.id, flags,
+                                           db_session)
+                    db_session.commit()
