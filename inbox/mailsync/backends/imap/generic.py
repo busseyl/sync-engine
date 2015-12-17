@@ -73,6 +73,7 @@ from sqlalchemy.orm.exc import NoResultFound
 from inbox.basicauth import ValidationError
 from inbox.util.concurrency import retry_with_logging
 from inbox.util.debug import bind_context
+from inbox.util.itert import chunk
 from inbox.util.misc import or_none
 from inbox.util.threading import fetch_corresponding_thread, MAX_THREAD_LENGTH
 from inbox.util.stats import statsd_client
@@ -616,9 +617,25 @@ class FolderSyncEngine(Greenlet):
         changed_flags = crispin_client.condstore_changed_flags(
             self.highestmodseq)
         remote_uids = crispin_client.all_uids()
+
+        # In order to be able to sync changes to tens of thousands of flags at
+        # once, we commit updates in batches. We do this in ascending order by
+        # modseq and periodically "checkpoint" our saved highestmodseq. That
+        # way if the process gets restarted halfway through this refresh, we
+        # don't have to completely start over. It's also slow to load many
+        # objects into the SQLAlchemy session and then issue lots of commits;
+        # we avoid that by batching.
+        flag_batches = chunk(sorted(changed_flags.items(),
+                                    key=lambda (k, v): v.modseq), 200)
+        for flag_batch in flag_batches:
+            with session_scope(self.namespace_id) as db_session:
+                common.update_metadata(self.account_id, self.folder_id,
+                                       dict(flag_batch), db_session)
+            if len(flag_batch) == 200:
+                interim_highestmodseq = max(v.modseq for k, v in flag_batch)
+                self.highestmodseq = interim_highestmodseq
+
         with session_scope(self.namespace_id) as db_session:
-            common.update_metadata(self.account_id, self.folder_id,
-                                   changed_flags, db_session)
             local_uids = common.local_uids(self.account_id, db_session,
                                            self.folder_id)
             expunged_uids = set(local_uids).difference(remote_uids)
