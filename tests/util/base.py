@@ -103,16 +103,6 @@ def patch_network_functions(monkeypatch):
                                 lambda *args, **kwargs: None)
 
 
-@yield_fixture(scope='function')
-def syncback_service():
-    from inbox.transactions.actions import SyncbackService
-    s = SyncbackService(poll_interval=0, retry_interval=0)
-    s.start()
-    yield s
-    s.stop()
-    s.join()
-
-
 def make_default_account(db, config):
     import platform
     from inbox.models.backends.gmail import GmailAccount
