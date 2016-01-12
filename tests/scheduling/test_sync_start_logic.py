@@ -1,3 +1,4 @@
+import pytest
 import platform
 from inbox.ignition import engine_manager
 from inbox.mailsync.service import SyncService
@@ -20,21 +21,12 @@ def purge_other_accounts(default_account=None):
 
 def test_start_already_assigned_accounts(db, default_account):
     purge_other_accounts(default_account)
-    default_account.sync_host = platform.node()
-    ss = SyncService(
-        process_identifier='{}:{}'.format(host, default_account.id % 2),
-        cpu_id=default_account.id % 2,
-        total_cpus=2)
+    process_identifier = '{}:{}'.format(host, default_account.id % 2)
+    default_account.sync_host = process_identifier
+    db.session.commit()
+    ss = SyncService(process_identifier=process_identifier,
+                     cpu_id=default_account.id % 2)
     assert ss.accounts_to_start() == {default_account.id}
-
-
-def test_dont_start_accounts_for_other_cpus(db, default_account):
-    purge_other_accounts(default_account)
-    default_account.sync_host = platform.node()
-    ss = SyncService(
-        process_identifier='{}:{}'.format(host, default_account.id + 1),
-        cpu_id=default_account.id + 1, total_cpus=2**22)
-    assert ss.accounts_to_start() == set()
 
 
 def test_dont_start_accounts_on_other_host(db, default_account):
@@ -43,49 +35,8 @@ def test_dont_start_accounts_on_other_host(db, default_account):
     db.session.commit()
     ss = SyncService(
         process_identifier='{}:{}'.format(host, 1),
-        cpu_id=1, total_cpus=2)
+        cpu_id=1)
     assert ss.accounts_to_start() == set()
-
-
-def test_accounts_started_when_process_assigned(db, default_account):
-    purge_other_accounts(default_account)
-    default_account.sync_host = '{}:{}'.format(platform.node(), 0)
-    db.session.commit()
-    ss = SyncService(
-        process_identifier='{}:{}'.format(host, 0),
-        cpu_id=0, total_cpus=2)
-    assert ss.accounts_to_start() == {default_account.id}
-
-    ss = SyncService(
-        process_identifier='{}:{}'.format(host, 1),
-        cpu_id=1, total_cpus=2)
-    assert ss.accounts_to_start() == set()
-
-
-def test_start_new_accounts_when_stealing_enabled(db, default_account):
-    purge_other_accounts(default_account)
-    default_account.sync_host = None
-    db.session.commit()
-    process_identifier = '{}:{}'.format(host, default_account.id % 2)
-    ss = SyncService(
-        process_identifier=process_identifier,
-        cpu_id=default_account.id % 2, total_cpus=2)
-    assert ss.accounts_to_start() == {default_account.id}
-    db.session.expire_all()
-    assert default_account.sync_host == process_identifier
-
-
-def test_dont_start_new_accounts_when_stealing_disabled(db, config,
-                                                        default_account):
-    purge_other_accounts(default_account)
-    default_account.sync_host = None
-    db.session.commit()
-    config['SYNC_STEAL_ACCOUNTS'] = False
-    ss = SyncService(
-        process_identifier='{}:{}'.format(host, default_account.id % 2),
-        cpu_id=default_account.id % 2, total_cpus=2)
-    assert ss.accounts_to_start() == set()
-    assert default_account.sync_host is None
 
 
 def test_dont_start_disabled_accounts(db, config, default_account):
@@ -96,7 +47,7 @@ def test_dont_start_disabled_accounts(db, config, default_account):
     db.session.commit()
     ss = SyncService(
         process_identifier='{}:{}'.format(host, 0),
-        cpu_id=0, total_cpus=1)
+        cpu_id=0)
     assert ss.accounts_to_start() == set()
     assert default_account.sync_host is None
     assert default_account.sync_should_run is False
@@ -106,7 +57,7 @@ def test_dont_start_disabled_accounts(db, config, default_account):
     db.session.commit()
     ss = SyncService(
         process_identifier='{}:{}'.format(host, 0),
-        cpu_id=0, total_cpus=1)
+        cpu_id=0)
     assert ss.accounts_to_start() == set()
     assert default_account.sync_should_run is False
 
@@ -118,7 +69,7 @@ def test_dont_start_disabled_accounts(db, config, default_account):
     # Don't steal invalid accounts
     ss = SyncService(
         process_identifier='{}:{}'.format(host, 0),
-        cpu_id=0, total_cpus=1)
+        cpu_id=0)
     assert ss.accounts_to_start() == set()
 
     # Don't explicitly start invalid accounts
@@ -126,29 +77,32 @@ def test_dont_start_disabled_accounts(db, config, default_account):
     db.session.commit()
     ss = SyncService(
         process_identifier='{}:{}'.format(host, 0),
-        cpu_id=0, total_cpus=1)
+        cpu_id=0)
     assert ss.accounts_to_start() == set()
 
 
 def test_concurrent_syncs(db, default_account, config):
     purge_other_accounts(default_account)
+    default_account.sync_host = None
+    db.session.commit()
     ss1 = SyncService(
         process_identifier='{}:{}'.format(host, default_account.id % 2),
-        cpu_id=default_account.id % 2, total_cpus=2)
+        cpu_id=default_account.id % 2)
     ss2 = SyncService(
-        process_identifier='{}:{}'.format(host, default_account.id % 2),
-        cpu_id=default_account.id % 2, total_cpus=2)
-    ss2.host = 'other-host'
+        process_identifier='{}:{}'.format('otherhost', default_account.id % 2),
+        cpu_id=default_account.id % 2)
     # Check that only one SyncService instance claims the account.
     assert ss1.accounts_to_start() == {default_account.id}
     assert ss2.accounts_to_start() == set()
 
 
 def test_sync_transitions(db, default_account, config):
+    default_account.sync_host = None
+    db.session.commit()
     purge_other_accounts(default_account)
     ss = SyncService(
         process_identifier='{}:{}'.format(host, default_account.id % 2),
-        cpu_id=default_account.id % 2, total_cpus=2)
+        cpu_id=default_account.id % 2)
     default_account.enable_sync()
     db.session.commit()
     assert ss.accounts_to_start() == {default_account.id}
@@ -176,7 +130,7 @@ def test_accounts_started_on_all_shards(db, default_account, config):
     process_identifier = '{}:{}'.format(host, 0)
     ss = SyncService(
         process_identifier=process_identifier,
-        cpu_id=0, total_cpus=1)
+        cpu_id=0)
     account_ids = {default_account.id}
     for key in (0, 1):
         with session_scope_by_shard_id(key) as db_session:
@@ -194,25 +148,34 @@ def test_accounts_started_on_all_shards(db, default_account, config):
             assert acc.sync_host == process_identifier
 
 
-def test_stealing_limited_by_host(db, config):
+@pytest.mark.parametrize('db_zone', ['us-west-2a', 'us-west-2b'])
+@pytest.mark.parametrize('steal', [True, False])
+def test_stealing_limited_by_zone_and_stealing_configuration(
+        db, config, default_account, db_zone, steal):
     host = platform.node()
-    config['DATABASE_HOSTS'][0]['SHARDS'][0]['SYNC_HOSTS'] = [host]
-    config['DATABASE_HOSTS'][0]['SHARDS'][1]['SYNC_HOSTS'] = ['otherhost']
-    purge_other_accounts()
-    process_identifier = '{}:{}'.format(host, 0)
-    ss = SyncService(process_identifier=process_identifier, cpu_id=0,
-                     total_cpus=1)
-    for key in (0, 1):
-        with session_scope_by_shard_id(key) as db_session:
-            acc = Account()
-            acc.namespace = Namespace()
-            db_session.add(acc)
-            db_session.commit()
+    host_zone = 'us-west-2a'
 
-    ss.accounts_to_start()
-    with session_scope_by_shard_id(0) as db_session:
-        acc = db_session.query(Account).first()
-        assert acc.sync_host == process_identifier
-    with session_scope_by_shard_id(1) as db_session:
-        acc = db_session.query(Account).first()
-        assert acc.sync_host is None
+    config['DATABASE_HOSTS'][0]['ZONE'] = db_zone
+    config['ZONE'] = host_zone
+    config['SYNC_STEAL_ACCOUNTS'] = steal
+    purge_other_accounts(default_account)
+    default_account.sync_host = None
+    db.session.commit()
+    process_identifier = '{}:{}'.format(host, 0)
+    ss = SyncService(process_identifier=process_identifier, cpu_id=0)
+    if steal and host_zone == db_zone:
+        assert ss.accounts_to_start() == {default_account.id}
+    else:
+        assert ss.accounts_to_start() == set()
+
+
+def test_stealing_if_zones_not_configured(db, config, default_account):
+    config['SYNC_STEAL_ACCOUNTS'] = True
+    if 'ZONE' in config:
+        del config['ZONE']
+    purge_other_accounts(default_account)
+    default_account.sync_host = None
+    db.session.commit()
+    process_identifier = '{}:{}'.format(host, 0)
+    ss = SyncService(process_identifier=process_identifier, cpu_id=0)
+    assert ss.accounts_to_start() == {default_account.id}
