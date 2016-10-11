@@ -41,16 +41,28 @@ for code in default_exceptions.iterkeys():
 def auth():
     """ Check for account ID on all non-root URLS """
     if request.path in ('/accounts', '/accounts/', '/') \
-                       or request.path.startswith('/w/'):
+            or request.path.startswith('/w/'):
         return
 
     if not request.authorization or not request.authorization.username:
-        return make_response((
-            "Could not verify access credential.", 401,
-            {'WWW-Authenticate': 'Basic realm="API '
-             'Access Token Required"'}))
 
-    namespace_public_id = request.authorization.username
+        AUTH_ERROR_MSG = ("Could not verify access credential.", 401,
+                          {'WWW-Authenticate': 'Basic realm="API '
+                              'Access Token Required"'})
+
+        auth_header = request.headers.get('Authorization', None)
+
+        if not auth_header:
+            return make_response(AUTH_ERROR_MSG)
+
+        parts = auth_header.split()
+
+        if (len(parts) != 2 or parts[0].lower() != 'bearer' or not parts[1]):
+            return make_response(AUTH_ERROR_MSG)
+        namespace_public_id = parts[1]
+
+    else:
+        namespace_public_id = request.authorization.username
 
     with global_session_scope() as db_session:
         try:
@@ -74,7 +86,7 @@ def finish(response):
         response.headers['Access-Control-Allow-Headers'] = \
             'Authorization,Content-Type'
         response.headers['Access-Control-Allow-Methods'] = \
-            'GET,PUT,POST,DELETE,OPTIONS'
+            'GET,PUT,POST,DELETE,OPTIONS,PATCH'
         response.headers['Access-Control-Allow-Credentials'] = 'true'
     return response
 

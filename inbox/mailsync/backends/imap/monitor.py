@@ -4,11 +4,10 @@ from gevent.coros import BoundedSemaphore
 from inbox.basicauth import ValidationError
 from nylas.logging import get_logger
 from inbox.crispin import retry_crispin, connection_pool
-from inbox.models import Account, Folder, Category
-from inbox.models.constants import MAX_FOLDER_NAME_LENGTH
+from inbox.models import Account, Folder
+from inbox.models.category import Category, sanitize_name
 from inbox.models.session import session_scope
 from inbox.mailsync.backends.base import BaseMailSyncMonitor
-from inbox.mailsync.backends.base import thread_polling
 from inbox.mailsync.backends.imap.generic import FolderSyncEngine
 from inbox.mailsync.gc import DeleteHandler
 log = get_logger()
@@ -55,7 +54,6 @@ class ImapSyncMonitor(BaseMailSyncMonitor):
             with session_scope(self.namespace_id) as db_session:
                 self.save_folder_names(db_session, remote_folders)
                 self.saved_remote_folders = remote_folders
-
         return sync_folders
 
     def save_folder_names(self, db_session, raw_folders):
@@ -78,7 +76,7 @@ class ImapSyncMonitor(BaseMailSyncMonitor):
 
         """
         account = db_session.query(Account).get(self.account_id)
-        remote_folder_names = {f.display_name.rstrip()[:MAX_FOLDER_NAME_LENGTH]
+        remote_folder_names = {sanitize_name(f.display_name)
                                for f in raw_folders}
 
         assert 'inbox' in {f.role for f in raw_folders},\
@@ -104,8 +102,12 @@ class ImapSyncMonitor(BaseMailSyncMonitor):
 
         # Create new folders
         for raw_folder in raw_folders:
-            Folder.find_or_create(db_session, account, raw_folder.display_name,
-                                  raw_folder.role)
+            folder = Folder.find_or_create(db_session, account,
+                                           raw_folder.display_name,
+                                           raw_folder.role)
+            if folder.canonical_name != raw_folder.role:
+                folder.canonical_name = raw_folder.role
+
         # Set the should_run bit for existing folders to True (it's True by
         # default for new ones.)
         for f in local_folders.values():
@@ -117,6 +119,7 @@ class ImapSyncMonitor(BaseMailSyncMonitor):
     def start_new_folder_sync_engines(self):
         running_monitors = {monitor.folder_name: monitor for monitor in
                             self.folder_monitors}
+
         for folder_name in self.prepare_sync():
             if folder_name in running_monitors:
                 thread = running_monitors[folder_name]
@@ -131,7 +134,8 @@ class ImapSyncMonitor(BaseMailSyncMonitor):
                                                 self.provider_name,
                                                 self.syncmanager_lock)
                 self.folder_monitors.start(thread)
-            while not thread_polling(thread) and not thread.ready():
+
+            while not thread.state == 'poll' and not thread.ready():
                 sleep(self.heartbeat)
 
             if thread.ready():
@@ -163,4 +167,4 @@ class ImapSyncMonitor(BaseMailSyncMonitor):
             with session_scope(self.namespace_id) as db_session:
                 account = db_session.query(Account).get(self.account_id)
                 account.mark_invalid()
-                account.update_sync_error(str(exc))
+                account.update_sync_error(exc)

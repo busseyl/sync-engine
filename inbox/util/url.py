@@ -1,8 +1,10 @@
 import dns
+import socket
 from dns.resolver import Resolver
 from dns.resolver import NoNameservers, NXDOMAIN, Timeout, NoAnswer
 from urllib import urlencode
 from nylas.logging import get_logger
+from tldextract import extract as tld_extract
 import re
 log = get_logger('inbox.util.url')
 
@@ -22,6 +24,10 @@ class InvalidEmailAddressError(Exception):
     pass
 
 
+def _dns_resolver():
+    return dns_resolver
+
+
 def _fallback_get_mx_domains(domain):
     """
     Sometimes dns.resolver.Resolver fails to return what we want. See
@@ -37,17 +43,18 @@ def _fallback_get_mx_domains(domain):
         return []
 
 
-def get_mx_domains(domain):
+def get_mx_domains(domain, dns_resolver=_dns_resolver):
     """ Retrieve and return the MX records for a domain. """
     mx_records = []
     try:
-        mx_records = dns_resolver.query(domain, 'MX')
+        mx_records = dns_resolver().query(domain, 'MX')
     except NoNameservers:
         log.error('NoMXservers', domain=domain)
     except NXDOMAIN:
         log.error('No such domain', domain=domain)
     except Timeout:
         log.error('Time out during resolution', domain=domain)
+        raise
     except NoAnswer:
         log.error('No answer from provider', domain=domain)
         mx_records = _fallback_get_mx_domains(domain)
@@ -74,22 +81,23 @@ def mx_match(mx_domains, match_domains):
         # Match the given domain against any of the mx_server regular
         # expressions we have stored for the given domain. If none of them
         # match, then we cannot confirm this as the given provider
-        match_filter = lambda x: re.match(x, mx_domain)
+        def match_filter(x):
+            return re.match(x, mx_domain)
         if any(match_filter(m) for m in match_domains):
             return True
 
     return False
 
 
-def provider_from_address(email_address):
+def provider_from_address(email_address, dns_resolver=_dns_resolver):
     if not EMAIL_REGEX.match(email_address):
         raise InvalidEmailAddressError('Invalid email address')
 
     domain = email_address.split('@')[1].lower()
-    mx_domains = get_mx_domains(domain)
+    mx_domains = get_mx_domains(domain, dns_resolver)
     ns_records = []
     try:
-        ns_records = dns_resolver.query(domain, 'NS')
+        ns_records = dns_resolver().query(domain, 'NS')
     except NoNameservers:
         log.error('NoNameservers', domain=domain)
     except NXDOMAIN:
@@ -100,8 +108,6 @@ def provider_from_address(email_address):
         log.error('No answer from provider', domain=domain)
 
     for (name, info) in providers.iteritems():
-        provider_mx = info.get('mx_servers', [])
-        provider_ns = info.get('ns_servers', [])
         provider_domains = info.get('domains', [])
 
         # If domain is in the list of known domains for a provider,
@@ -110,10 +116,16 @@ def provider_from_address(email_address):
             if domain.endswith(d):
                 return name
 
+    for (name, info) in providers.iteritems():
+        provider_mx = info.get('mx_servers', [])
+
         # If a retrieved mx_domain is in the list of stored MX domains for a
         # provider, return the provider.
         if mx_match(mx_domains, provider_mx):
             return name
+
+    for (name, info) in providers.iteritems():
+        provider_ns = info.get('ns_servers', [])
 
         # If a retrieved name server is in the list of stored name servers for
         # a provider, return the provider.
@@ -152,3 +164,76 @@ def url_concat(url, args, fragments=None):
         args_tail += urlencode(args)
 
     return url + args_tail + fragment_tail
+
+
+def resolve_hostname(addr):
+    try:
+        return socket.gethostbyname(addr)
+    except socket.error:
+        return None
+
+
+def parent_domain(domain):
+    return tld_extract(domain).registered_domain
+
+
+def naked_domain(url):
+    # This function extracts the domain name part of an URL.
+    # It works indiscriminately on URLs or plain domains.
+    res = tld_extract(url)
+
+    if not res.subdomain or res.subdomain == '':
+        return res.registered_domain
+    else:
+        return ".".join([res.subdomain, res.registered_domain])
+
+
+def matching_subdomains(new_value, old_value):
+    """
+    We allow our customers to update their server addresses,
+    provided that the new server has:
+    1. the same IP as the old server
+    2. shares the same top-level domain name.
+
+    """
+
+    if new_value is None and old_value is not None:
+        return False
+
+    if new_value.lower() == old_value.lower():
+        return True
+
+    new_domain = naked_domain(new_value)
+    old_domain = naked_domain(old_value)
+
+    if new_domain == old_domain:
+        return True
+
+    new_parent_domain = parent_domain(new_value)
+    old_parent_domain = parent_domain(old_value)
+
+    if old_parent_domain is None:
+        log.error('old_parent_domain is None',
+                  old_value=old_value, new_value=new_value)
+        # Shouldn't actually happen.
+        return False
+
+    if new_parent_domain is None:
+        log.error('new_parent_domain is None',
+                  old_value=old_value, new_value=new_value)
+        return False
+
+    if new_parent_domain != old_parent_domain:
+        log.error("Domains aren't matching",
+                  new_value=new_value, old_value=old_value)
+        return False
+
+    new_ip = resolve_hostname(new_value)
+    old_ip = resolve_hostname(old_value)
+
+    if (new_ip is None or old_ip is None or new_ip != old_ip):
+        log.error("IP addresses aren't matching",
+                  new_value=new_value, old_Value=old_value)
+        return False
+
+    return True

@@ -1,9 +1,13 @@
-import base64
 import os
-import uuid
-import gevent
+import sys
+import json
 import time
+import uuid
+import base64
+import gevent
+import itertools
 from datetime import datetime
+from collections import namedtuple
 
 from flask import (request, g, Blueprint, make_response, Response,
                    stream_with_context)
@@ -12,25 +16,27 @@ from flask.ext.restful import reqparse
 from sqlalchemy import asc, func
 from sqlalchemy.orm.exc import NoResultFound
 
-from nylas.logging import get_logger
-log = get_logger()
 from inbox.models import (Message, Block, Part, Thread, Namespace,
                           Contact, Calendar, Event, Transaction,
                           DataProcessingCache, Category, MessageCategory)
 from inbox.models.event import RecurringEvent, RecurringEventOverride
+from inbox.models.category import EPOCH
 from inbox.models.backends.generic import GenericAccount
-from inbox.api.sending import send_draft, send_raw_mime
+from inbox.api.sending import (send_draft, send_raw_mime, send_draft_copy,
+                               update_draft_on_send)
 from inbox.api.update import update_message, update_thread
 from inbox.api.kellogs import APIEncoder
 from inbox.api import filtering
-from inbox.api.validation import (get_attachments, get_calendar,
+from inbox.api.validation import (valid_account, get_attachments, get_calendar,
                                   get_recipients, get_draft, valid_public_id,
                                   valid_event, valid_event_update, timestamp,
                                   bounded_str, view, strict_parse_args,
                                   limit, offset, ValidatableArgument,
                                   strict_bool, validate_draft_recipients,
                                   valid_delta_object_types, valid_display_name,
-                                  noop_event_update)
+                                  noop_event_update, valid_category_type,
+                                  comma_separated_email_list,
+                                  get_sending_draft)
 from inbox.config import config
 from inbox.contacts.algorithms import (calculate_contact_scores,
                                        calculate_group_scores,
@@ -45,20 +51,26 @@ from inbox.models.action_log import schedule_action
 from inbox.models.session import new_session, session_scope
 from inbox.search.base import get_search_client, SearchBackendException
 from inbox.transactions import delta_sync
-from inbox.api.err import err, APIException, NotFoundError, InputError
-from inbox.events.ical import (generate_icalendar_invite, send_invite,
-                               generate_rsvp, send_rsvp)
+from inbox.api.err import (err, APIException, NotFoundError, InputError,
+                           AccountDoesNotExistError, log_exception)
+from inbox.events.ical import generate_rsvp, send_rsvp
+from inbox.events.util import removed_participants
 from inbox.util.blockstore import get_from_blockstore
+from inbox.util.misc import imap_folder_path
+from inbox.actions.backends.generic import remote_delete_sent
+from inbox.crispin import writable_connection_pool
 
 DEFAULT_LIMIT = 100
-MAX_LIMIT = 1000
 LONG_POLL_REQUEST_TIMEOUT = 120
+LONG_POLL_POLL_INTERVAL = 1
 SEND_TIMEOUT = 60
 
 app = Blueprint(
     'namespace_api',
     __name__,
     url_prefix='')
+
+app.log_exception = log_exception
 
 # Configure mimetype -> extension map
 # TODO perhaps expand to encompass non-standard mimetypes too
@@ -81,24 +93,77 @@ if config.get('DEBUG_PROFILING_ON'):
     from inbox.util.debug import attach_pyinstrument_profiler
     attach_pyinstrument_profiler()
 
+APIFeatures = namedtuple('APIFeatures', ['optimistic_updates'])
+
+# The Nylas API supports versioning to be fully compatible with
+# older clients and apps. Users can specify the version of the
+# API they want to work with by setting the Api-Version API
+# header. API versions are defined as dates and stored in the
+# API_VERSIONS list.
+API_VERSIONS = ['2016-03-07', '2016-08-09']
 
 @app.before_request
 def start():
+    g.api_version = request.headers.get('Api-Version', API_VERSIONS[0])
+
+    if g.api_version not in API_VERSIONS:
+        g.api_version = API_VERSIONS[0]
+
+    if g.api_version == API_VERSIONS[0]:
+        g.api_features = APIFeatures(optimistic_updates=True)
+    else:
+        g.api_features = APIFeatures(optimistic_updates=False)
+
     engine = engine_manager.get_for_id(g.namespace_id)
     g.db_session = new_session(engine)
     g.namespace = Namespace.get(g.namespace_id, g.db_session)
-    g.encoder = APIEncoder(g.namespace.public_id)
-    g.log = log.new(endpoint=request.endpoint,
-                    account_id=g.namespace.account_id)
+
+    request.environ['log_context'] = {
+        'endpoint': request.endpoint,
+    }
+    if not g.namespace:
+        # The only way this can occur is if there used to be an account that
+        # was deleted, but the API access cache entry has not been expired yet.
+        raise AccountDoesNotExistError()
+
+    request.environ['log_context'].update({
+        'account_id': g.namespace.account_id,
+        'namespace_id': g.namespace.id,
+    })
+
+    is_n1 = request.environ.get('IS_N1', False)
+    g.encoder = APIEncoder(g.namespace.public_id, is_n1=is_n1)
+
     g.parser = reqparse.RequestParser(argument_class=ValidatableArgument)
     g.parser.add_argument('limit', default=DEFAULT_LIMIT, type=limit,
                           location='args')
     g.parser.add_argument('offset', default=0, type=offset, location='args')
 
 
+@app.before_request
+def before_remote_request():
+    """
+    Verify the validity of the account's credentials before performing a
+    request to the remote server.
+
+    The message and thread /search endpoints, and the /send endpoint directly
+    interact with the remote server. All create, update, delete requests
+    result in requests to the remote server via action syncback.
+
+    """
+    # Search uses 'GET', all the other requests we care about use a write
+    # HTTP method.
+    if (request.endpoint in ('namespace_api.message_search_api',
+                             'namespace_api.thread_search_api',
+                             'namespace_api.message_streaming_search_api',
+                             'namespace_api.thread_streaming_search_api') or
+            request.method in ('POST', 'PUT', 'PATCH', 'DELETE')):
+        valid_account(g.namespace)
+
+
 @app.after_request
 def finish(response):
-    if response.status_code == 200 and hasattr(g, 'db_session'):  # be cautions
+    if response.status_code == 200 and hasattr(g, 'db_session'):  # be cautious
         g.db_session.commit()
     if hasattr(g, 'db_session'):
         g.db_session.close()
@@ -107,7 +172,8 @@ def finish(response):
 
 @app.errorhandler(NotImplementedError)
 def handle_not_implemented_error(error):
-    response = flask_jsonify(message="API endpoint not yet implemented.",
+    request.environ['log_context']['error'] = 'NotImplementedError'
+    response = flask_jsonify(message="API endpoint not yet implemented",
                              type='api_error')
     response.status_code = 501
     return response
@@ -115,15 +181,31 @@ def handle_not_implemented_error(error):
 
 @app.errorhandler(APIException)
 def handle_input_error(error):
+    # these "errors" are normal, so we don't need to save a traceback
+    request.environ['log_context']['error'] = error.__class__.__name__
+    request.environ['log_context']['error_message'] = error.message
     response = flask_jsonify(message=error.message,
                              type='invalid_request_error')
     response.status_code = error.status_code
     return response
 
 
+@app.errorhandler(Exception)
+def handle_generic_error(error):
+    log_exception(sys.exc_info())
+    response = flask_jsonify(message=error.message,
+                             type='api_error')
+    response.status_code = 500
+    return response
+
+
 @app.route('/account')
 def one_account():
-    return g.encoder.jsonify(g.namespace)
+    g.parser.add_argument('view', type=view, location='args')
+    args = strict_parse_args(g.parser, request.args)
+    # Use a new encoder object with the expand parameter set.
+    encoder = APIEncoder(g.namespace.public_id, args['view'] == 'expanded')
+    return encoder.jsonify(g.namespace)
 
 
 #
@@ -136,7 +218,8 @@ def thread_query_api():
     g.parser.add_argument('from', type=bounded_str, location='args')
     g.parser.add_argument('cc', type=bounded_str, location='args')
     g.parser.add_argument('bcc', type=bounded_str, location='args')
-    g.parser.add_argument('any_email', type=bounded_str, location='args')
+    g.parser.add_argument('any_email', type=comma_separated_email_list,
+                          location='args')
     g.parser.add_argument('started_before', type=timestamp, location='args')
     g.parser.add_argument('started_after', type=timestamp, location='args')
     g.parser.add_argument('last_message_before', type=timestamp,
@@ -187,15 +270,35 @@ def thread_search_api():
     if not args['q']:
         err_string = ('GET HTTP method must include query'
                       ' url parameter')
-        g.log.error(err_string)
-        return err(400, err_string)
+        raise InputError(err_string)
 
-    search_client = get_search_client(g.namespace.account)
     try:
+        search_client = get_search_client(g.namespace.account)
         results = search_client.search_threads(g.db_session, args['q'],
                                                offset=args['offset'],
                                                limit=args['limit'])
         return g.encoder.jsonify(results)
+    except SearchBackendException as exc:
+        kwargs = {}
+        if exc.server_error:
+            kwargs['server_error'] = exc.server_error
+        return err(exc.http_code, exc.message, **kwargs)
+
+
+@app.route('/threads/search/streaming', methods=['GET'])
+def thread_streaming_search_api():
+    g.parser.add_argument('q', type=bounded_str, location='args')
+    args = strict_parse_args(g.parser, request.args)
+    if not args['q']:
+        err_string = 'GET HTTP method must include query url parameter'
+        raise InputError(err_string)
+
+    try:
+        search_client = get_search_client(g.namespace.account)
+        generator = search_client.stream_threads(args['q'])
+
+        return Response(stream_with_context(generator()),
+                        mimetype='text/json-stream')
     except SearchBackendException as exc:
         kwargs = {}
         if exc.server_error:
@@ -222,7 +325,7 @@ def thread_api(public_id):
 #
 # Update thread
 #
-@app.route('/threads/<public_id>', methods=['PUT'])
+@app.route('/threads/<public_id>', methods=['PUT', 'PATCH'])
 def thread_api_update(public_id):
     try:
         valid_public_id(public_id)
@@ -234,7 +337,10 @@ def thread_api_update(public_id):
     data = request.get_json(force=True)
     if not isinstance(data, dict):
         raise InputError('Invalid request body')
-    update_thread(thread, data, g.db_session)
+
+    update_thread(thread, data, g.db_session,
+                  g.api_features.optimistic_updates)
+
     return g.encoder.jsonify(thread)
 
 
@@ -257,7 +363,8 @@ def message_query_api():
     g.parser.add_argument('from', type=bounded_str, location='args')
     g.parser.add_argument('cc', type=bounded_str, location='args')
     g.parser.add_argument('bcc', type=bounded_str, location='args')
-    g.parser.add_argument('any_email', type=bounded_str, location='args')
+    g.parser.add_argument('any_email', type=comma_separated_email_list,
+                          location='args')
     g.parser.add_argument('started_before', type=timestamp, location='args')
     g.parser.add_argument('started_after', type=timestamp, location='args')
     g.parser.add_argument('last_message_before', type=timestamp,
@@ -312,17 +419,36 @@ def message_search_api():
     g.parser.add_argument('q', type=bounded_str, location='args')
     args = strict_parse_args(g.parser, request.args)
     if not args['q']:
-        err_string = ('GET HTTP method must include query'
-                      ' url parameter')
-        g.log.error(err_string)
-        return err(400, err_string)
+        err_string = 'GET HTTP method must include query url parameter'
+        raise InputError(err_string)
 
-    search_client = get_search_client(g.namespace.account)
     try:
+        search_client = get_search_client(g.namespace.account)
         results = search_client.search_messages(g.db_session, args['q'],
                                                 offset=args['offset'],
                                                 limit=args['limit'])
         return g.encoder.jsonify(results)
+    except SearchBackendException as exc:
+        kwargs = {}
+        if exc.server_error:
+            kwargs['server_error'] = exc.server_error
+        return err(exc.http_code, exc.message, **kwargs)
+
+
+@app.route('/messages/search/streaming', methods=['GET'])
+def message_streaming_search_api():
+    g.parser.add_argument('q', type=bounded_str, location='args')
+    args = strict_parse_args(g.parser, request.args)
+    if not args['q']:
+        err_string = 'GET HTTP method must include query url parameter'
+        raise InputError(err_string)
+
+    try:
+        search_client = get_search_client(g.namespace.account)
+        generator = search_client.stream_messages(args['q'])
+
+        return Response(stream_with_context(generator()),
+                        mimetype='text/json-stream')
     except SearchBackendException as exc:
         kwargs = {}
         if exc.server_error:
@@ -348,7 +474,7 @@ def message_read_api(public_id):
         if raw_message is not None:
             return Response(raw_message, mimetype='message/rfc822')
         else:
-            g.log.error('Missing raw MIME message', id=message.id)
+            request.environ['log_context']['message_id'] = message.id
             raise NotFoundError(
                 "Couldn't find raw contents for message `{0}`"
                 .format(public_id))
@@ -356,7 +482,7 @@ def message_read_api(public_id):
     return encoder.jsonify(message)
 
 
-@app.route('/messages/<public_id>', methods=['PUT'])
+@app.route('/messages/<public_id>', methods=['PUT', 'PATCH'])
 def message_update_api(public_id):
     try:
         valid_public_id(public_id)
@@ -368,7 +494,10 @@ def message_update_api(public_id):
     data = request.get_json(force=True)
     if not isinstance(data, dict):
         raise InputError('Invalid request body')
-    update_message(message, data, g.db_session)
+
+    update_message(message, data, g.db_session,
+                   g.api_features.optimistic_updates)
+
     return g.encoder.jsonify(message)
 
 
@@ -376,6 +505,10 @@ def message_update_api(public_id):
 @app.route('/folders')
 @app.route('/labels')
 def folders_labels_query_api():
+    category_type = g.namespace.account.category_type
+    rule = request.url_rule.rule
+    valid_category_type(category_type, rule)
+
     g.parser.add_argument('view', type=bounded_str, location='args')
     args = strict_parse_args(g.parser, request.args)
     if args['view'] == 'count':
@@ -386,7 +519,7 @@ def folders_labels_query_api():
         results = g.db_session.query(Category)
 
     results = results.filter(Category.namespace_id == g.namespace.id,
-                             Category.deleted_at == None)  # noqa
+                             Category.deleted_at == EPOCH)  # noqa
     results = results.order_by(asc(Category.id))
 
     if args['view'] == 'count':
@@ -409,12 +542,15 @@ def label_api(public_id):
 
 
 def folders_labels_api_impl(public_id):
+    category_type = g.namespace.account.category_type
+    rule = request.url_rule.rule
+    valid_category_type(category_type, rule)
     valid_public_id(public_id)
     try:
         category = g.db_session.query(Category).filter(
             Category.namespace_id == g.namespace.id,
             Category.public_id == public_id,
-            Category.deleted_at == None).one()  # noqa
+            Category.deleted_at == EPOCH).one()  # noqa
     except NoResultFound:
         raise NotFoundError('Object not found')
     return g.encoder.jsonify(category)
@@ -424,35 +560,39 @@ def folders_labels_api_impl(public_id):
 @app.route('/labels', methods=['POST'])
 def folders_labels_create_api():
     category_type = g.namespace.account.category_type
+    rule = request.url_rule.rule
+    valid_category_type(category_type, rule)
     data = request.get_json(force=True)
     display_name = data.get('display_name')
 
+    # Validates the display_name and checks if there is a non-deleted Category
+    # with this display_name already. If so, we do not allow creating a
+    # duplicate.
     valid_display_name(g.namespace.id, category_type, display_name,
                        g.db_session)
 
-    # We do not allow creating a category with the same name as a
-    # deleted category /until/ the corresponding folder/label
-    # delete syncback is performed. This is a limitation but is the
-    # simplest way to prevent the creation of categories with duplicate
-    # names; it also hinders creation in the one case only (namely,
-    # delete category with display_name "x" via the API -> quickly
-    # try to create a category with the same display_name).
-    category = g.db_session.query(Category).filter(
-        Category.namespace_id == g.namespace.id,
-        Category.name == None,  # noqa
-        Category.display_name == display_name,
-        Category.type_ == category_type).first()
-
-    if category:
-        return err(403, "{} with name {} already exists".
-                        format(category_type, display_name))
+    if g.namespace.account.provider not in ['gmail', 'eas']:
+        # Translate the name of the folder to an actual IMAP name
+        # (e.g: "Accounting/Taxes" becomes "Accounting.Taxes")
+        display_name = imap_folder_path(
+            display_name,
+            separator=g.namespace.account.folder_separator,
+            prefix=g.namespace.account.folder_prefix)
 
     category = Category.find_or_create(g.db_session, g.namespace.id,
                                        name=None, display_name=display_name,
                                        type_=category_type)
-    if category.deleted_at:
-        category = Category(namespace_id=g.namespace.id, name=None,
-                            display_name=display_name, type_=category_type)
+    if category.is_deleted:
+        # The existing category is soft-deleted and will be hard-deleted,
+        # so it is okay to create a new category with the same (display_name,
+        # name).
+        # NOTE: We do not simply "undelete" the existing category, by setting
+        # its `deleted_at`=EPOCH, because doing so would not be consistent with
+        # the API's semantics -- we want the newly created object to have a
+        # different ID.
+        category = Category.create(g.db_session, namespace_id=g.namespace.id,
+                                   name=None, display_name=display_name,
+                                   type_=category_type)
         g.db_session.add(category)
     g.db_session.flush()
 
@@ -465,20 +605,22 @@ def folders_labels_create_api():
     return g.encoder.jsonify(category)
 
 
-@app.route('/folders/<public_id>', methods=['PUT'])
-@app.route('/labels/<public_id>', methods=['PUT'])
+@app.route('/folders/<public_id>', methods=['PUT', 'PATCH'])
+@app.route('/labels/<public_id>', methods=['PUT', 'PATCH'])
 def folder_label_update_api(public_id):
     category_type = g.namespace.account.category_type
+    rule = request.url_rule.rule
+    valid_category_type(category_type, rule)
     valid_public_id(public_id)
     try:
         category = g.db_session.query(Category).filter(
             Category.namespace_id == g.namespace.id,
             Category.public_id == public_id,
-            Category.deleted_at == None).one()  # noqa
+            Category.deleted_at == EPOCH).one()  # noqa
     except NoResultFound:
         raise InputError("Couldn't find {} {}".format(
             category_type, public_id))
-    if category.name is not None:
+    if category.name:
         raise InputError("Cannot modify a standard {}".format(category_type))
 
     data = request.get_json(force=True)
@@ -486,19 +628,29 @@ def folder_label_update_api(public_id):
     valid_display_name(g.namespace.id, category_type, display_name,
                        g.db_session)
 
+    if g.namespace.account.provider not in ['gmail', 'eas']:
+        # Translate the name of the folder to an actual IMAP name
+        # (e.g: "Accounting/Taxes" becomes "Accounting.Taxes")
+        display_name = imap_folder_path(
+            display_name,
+            separator=g.namespace.account.folder_separator,
+            prefix=g.namespace.account.folder_prefix)
+
     current_name = category.display_name
-    category.display_name = display_name
-    g.db_session.flush()
+
+    if g.api_features.optimistic_updates:
+        # Update optimistically.
+        category.display_name = display_name
+        g.db_session.flush()
 
     if category_type == 'folder':
         schedule_action('update_folder', category, g.namespace.id,
-                        g.db_session, old_name=current_name)
+                        g.db_session, old_name=current_name,
+                        new_name=display_name)
     else:
         schedule_action('update_label', category, g.namespace.id,
-                        g.db_session, old_name=current_name)
-
-    # TODO[k]: Update corresponding folder/ label once syncback is successful,
-    # rather than waiting for sync to pick it up?
+                        g.db_session, old_name=current_name,
+                        new_name=display_name)
 
     return g.encoder.jsonify(category)
 
@@ -507,16 +659,18 @@ def folder_label_update_api(public_id):
 @app.route('/labels/<public_id>', methods=['DELETE'])
 def folder_label_delete_api(public_id):
     category_type = g.namespace.account.category_type
+    rule = request.url_rule.rule
+    valid_category_type(category_type, rule)
     valid_public_id(public_id)
     try:
         category = g.db_session.query(Category).filter(
             Category.namespace_id == g.namespace.id,
             Category.public_id == public_id,
-            Category.deleted_at == None).one()  # noqa
+            Category.deleted_at == EPOCH).one()  # noqa
     except NoResultFound:
         raise InputError("Couldn't find {} {}".format(
             category_type, public_id))
-    if category.name is not None:
+    if category.name:
         raise InputError("Cannot modify a standard {}".format(category_type))
 
     if category.type_ == 'folder':
@@ -524,23 +678,27 @@ def folder_label_delete_api(public_id):
             MessageCategory.category_id == category.id).exists()
         messages_exist = g.db_session.query(messages_with_category).scalar()
         if messages_exist:
-            return err(403, "Folder {} cannot be deleted because it contains "
-                            "messages.".format(public_id))
+            raise InputError(
+                "Folder {} cannot be deleted because it contains messages.".
+                format(public_id))
 
-        deleted_at = datetime.utcnow()
-        category.deleted_at = deleted_at
-        folders = category.folders if g.namespace.account.discriminator != 'easaccount' \
-            else category.easfolders
-        for folder in folders:
-            folder.deleted_at = deleted_at
+
+        if g.api_features.optimistic_updates:
+            deleted_at = datetime.utcnow()
+            category.deleted_at = deleted_at
+            folders = category.folders if g.namespace.account.discriminator \
+                != 'easaccount' else category.easfolders
+            for folder in folders:
+                folder.deleted_at = deleted_at
 
         schedule_action('delete_folder', category, g.namespace.id,
                         g.db_session)
     else:
-        deleted_at = datetime.utcnow()
-        category.deleted_at = deleted_at
-        for label in category.labels:
-            label.deleted_at = deleted_at
+        if g.api_features.optimistic_updates:
+            deleted_at = datetime.utcnow()
+            category.deleted_at = deleted_at
+            for label in category.labels:
+                label.deleted_at = deleted_at
 
         schedule_action('delete_label', category, g.namespace.id,
                         g.db_session)
@@ -592,8 +750,7 @@ def contact_search_api():
     if not args['q']:
         err_string = ('GET HTTP method must include query'
                       ' url parameter')
-        g.log.error(err_string)
-        return err(400, err_string)
+        raise InputError(err_string)
 
     search_client = ContactSearchClient(g.namespace.id)
     results = search_client.search_contacts(g.db_session, args['q'],
@@ -727,7 +884,7 @@ def event_read_api(public_id):
     return g.encoder.jsonify(event)
 
 
-@app.route('/events/<public_id>', methods=['PUT'])
+@app.route('/events/<public_id>', methods=['PUT', 'PATCH'])
 def event_update_api(public_id):
     g.parser.add_argument('notify_participants', type=strict_bool,
                           location='args')
@@ -741,8 +898,15 @@ def event_update_api(public_id):
             Event.namespace_id == g.namespace.id).one()
     except NoResultFound:
         raise NotFoundError("Couldn't find event {0}".format(public_id))
+
+    # iCalendar-imported files are read-only by default but let's give a
+    # slightly more helpful error message.
+    if event.calendar == g.namespace.account.emailed_events_calendar:
+        raise InputError('Can not update an event imported from an iCalendar file.')
+
     if event.read_only:
         raise InputError('Cannot update read_only event.')
+
     if (isinstance(event, RecurringEvent) or
             isinstance(event, RecurringEventOverride)):
         raise InputError('Cannot update a recurring event yet.')
@@ -752,27 +916,54 @@ def event_update_api(public_id):
 
     valid_event_update(data, g.namespace, g.db_session)
 
+    # A list of participants we need to send cancellation invites to.
+    cancelled_participants = []
     if 'participants' in data:
         for p in data['participants']:
             if 'status' not in p:
                 p['status'] = 'noreply'
 
+        cancelled_participants = removed_participants(event.participants,
+                                                      data['participants'])
+
+        # We're going to save this data into a JSON-like TEXT field in the
+        # db. With MySQL, this means that the column will be 64k.
+        # Drop the latest participants until it fits in the column.
+        while len(json.dumps(cancelled_participants)) > 63000:
+            cancelled_participants.pop()
+
     # Don't update an event if we don't need to.
     if noop_event_update(event, data):
         return g.encoder.jsonify(event)
 
-    for attr in Event.API_MODIFIABLE_FIELDS:
-        if attr in data:
-            setattr(event, attr, data[attr])
+    if g.api_features.optimistic_updates:
+        for attr in Event.API_MODIFIABLE_FIELDS:
+            if attr in data:
+                setattr(event, attr, data[attr])
 
-    event.sequence_number += 1
-    g.db_session.commit()
+        event.sequence_number += 1
+        g.db_session.commit()
 
-    # Don't sync back updates to autoimported events.
-    if event.calendar != account.emailed_events_calendar:
         schedule_action('update_event', event, g.namespace.id, g.db_session,
                         calendar_uid=event.calendar.uid,
+                        cancelled_participants=cancelled_participants,
                         notify_participants=notify_participants)
+    else:
+        # This isn't an optimistic update, so we need to store the
+        # updated attributes inside the ActionLog entry.
+        # Once we've update the event on the backend, we'll be able
+        # to propagate the changes to our datastore.
+        kwargs = dict(calendar_uid=event.calendar.uid,
+                      event_data=data,
+                      cancelled_participants=cancelled_participants,
+                      notify_participants=notify_participants)
+
+        if len(json.dumps(kwargs)) > 2**16 - 12:
+            raise InputError('Event update too big --- please break it in parts.')
+
+        if event.calendar != account.emailed_events_calendar:
+            schedule_action('update_event', event, g.namespace.id, g.db_session,
+                            **kwargs)
 
     return g.encoder.jsonify(event)
 
@@ -791,25 +982,22 @@ def event_delete_api(public_id):
             namespace_id=g.namespace.id).one()
     except NoResultFound:
         raise NotFoundError("Couldn't find event {0}".format(public_id))
+
+    if event.calendar == g.namespace.account.emailed_events_calendar:
+        raise InputError('Can not update an event imported from an iCalendar file.')
+
     if event.calendar.read_only:
         raise InputError('Cannot delete event {} from read_only calendar.'.
                          format(public_id))
 
-    # Set the local event status to 'cancelled' rather than deleting it,
-    # in order to be consistent with how we sync deleted events from the
-    # remote, and consequently return them through the events, delta sync APIs
-    event.sequence_number += 1
-    event.status = 'cancelled'
-    g.db_session.commit()
 
-    account = g.namespace.account
-
-    # FIXME @karim: do this in the syncback thread instead.
-    if notify_participants and account.provider != 'gmail':
-        ical_file = generate_icalendar_invite(event,
-                                              invite_type='cancel').to_ical()
-
-        send_invite(ical_file, event, account, invite_type='cancel')
+    if g.api_features.optimistic_updates:
+        # Set the local event status to 'cancelled' rather than deleting it,
+        # in order to be consistent with how we sync deleted events from the
+        # remote, and consequently return them through the events, delta sync APIs
+        event.sequence_number += 1
+        event.status = 'cancelled'
+        g.db_session.commit()
 
     schedule_action('delete_event', event, g.namespace.id, g.db_session,
                     event_uid=event.uid, calendar_name=event.calendar.name,
@@ -971,7 +1159,7 @@ def file_delete_api(public_id):
 def file_upload_api():
     all_files = []
     for name, uploaded in request.files.iteritems():
-        g.log.info("Processing upload '{0}'".format(name))
+        request.environ['log_context'].setdefault('filenames', []).append(name)
         f = Block()
         f.namespace = g.namespace
         f.content_type = uploaded.content_type
@@ -1007,18 +1195,17 @@ def file_download_api(public_id):
     else:
         # TODO Detect the content-type using the magic library
         # and set ct = the content type, which is used below
-        g.log.error("Content type not set! Defaulting to text/plain")
+        request.environ['log_context']['no_content_type'] = True
         ct = 'text/plain'
+    request.environ['log_context']['content_type'] = ct
 
     if f.filename:
         name = f.filename
     else:
-        g.log.debug("No filename. Generating...")
+        request.environ['log_context']['no_filename'] = True
         if ct in common_extensions:
             name = 'attachment.{0}'.format(common_extensions[ct])
         else:
-            g.log.error("Unknown extension for content-type: {0}"
-                        .format(ct))
             # HACK just append the major part of the content type
             name = 'attachment.{0}'.format(ct.split('/')[0])
 
@@ -1037,7 +1224,7 @@ def file_download_api(public_id):
     response.headers['Content-Disposition'] = \
         'attachment; filename={0}'.format(name)
 
-    g.log.info(response.headers)
+    request.environ['log_context']['headers'] = response.headers
     return response
 
 
@@ -1096,7 +1283,8 @@ def draft_query_api():
     g.parser.add_argument('to', type=bounded_str, location='args')
     g.parser.add_argument('cc', type=bounded_str, location='args')
     g.parser.add_argument('bcc', type=bounded_str, location='args')
-    g.parser.add_argument('any_email', type=bounded_str, location='args')
+    g.parser.add_argument('any_email', type=comma_separated_email_list,
+                          location='args')
     g.parser.add_argument('started_before', type=timestamp, location='args')
     g.parser.add_argument('started_after', type=timestamp, location='args')
     g.parser.add_argument('last_message_before', type=timestamp,
@@ -1163,7 +1351,7 @@ def draft_create_api():
     return g.encoder.jsonify(draft)
 
 
-@app.route('/drafts/<public_id>', methods=['PUT'])
+@app.route('/drafts/<public_id>', methods=['PUT', 'PATCH'])
 def draft_update_api(public_id):
     data = request.get_json(force=True)
     original_draft = get_draft(public_id, data.get('version'), g.namespace.id,
@@ -1211,10 +1399,13 @@ def draft_send_api():
     request_started = time.time()
     account = g.namespace.account
     if request.content_type == "message/rfc822":
-        msg = create_draft_from_mime(account, request.data,
-                                     g.db_session)
-        validate_draft_recipients(msg)
-        resp = send_raw_mime(account, g.db_session, msg)
+        draft = create_draft_from_mime(account, request.data,
+                                       g.db_session)
+        validate_draft_recipients(draft)
+        if isinstance(account, GenericAccount):
+            schedule_action('save_sent_email', draft, draft.namespace.id,
+                            g.db_session)
+        resp = send_raw_mime(account, g.db_session, draft)
         return resp
 
     data = request.get_json(force=True)
@@ -1223,7 +1414,7 @@ def draft_send_api():
         draft = get_draft(draft_public_id, data.get('version'),
                           g.namespace.id, g.db_session)
         schedule_action('delete_draft', draft, draft.namespace.id,
-                        g.db_session, inbox_uid=draft.inbox_uid,
+                        g.db_session, nylas_uid=draft.nylas_uid,
                         message_id_header=draft.message_id_header)
     else:
         draft = create_message_from_json(data, g.namespace,
@@ -1240,6 +1431,111 @@ def draft_send_api():
 
     resp = send_draft(account, draft, g.db_session)
     return resp
+
+
+@app.route('/send-multiple', methods=['POST'])
+def multi_send_create():
+    """Initiates a multi-send session by creating a new multi-send draft."""
+    account = g.namespace.account
+
+    if account.discriminator == 'easaccount':
+        raise InputError('Multiple send is not supported for this provider.')
+
+    data = request.get_json(force=True)
+
+    # Make a new draft and don't save it to the remote (by passing
+    # is_draft=False)
+    draft = create_message_from_json(data, g.namespace,
+                                     g.db_session, is_draft=False)
+    validate_draft_recipients(draft)
+
+    # Mark the draft as sending, which ensures that it cannot be modified.
+    draft.mark_as_sending()
+    g.db_session.add(draft)
+    request.environ['log_context']['draft_public_id'] = draft.public_id
+    return g.encoder.jsonify(draft)
+
+
+@app.route('/send-multiple/<draft_id>', methods=['POST'])
+def multi_send(draft_id):
+    """Performs a single send operation in an individualized multi-send
+    session. Sends a copy of the draft at draft_id to the specified address
+    with the specified body, and ensures that a corresponding sent message is
+    either not created in the user's Sent folder or is immediately
+    deleted from it."""
+    request_started = time.time()
+    account = g.namespace.account
+
+    if account.discriminator == 'easaccount':
+        raise InputError('Multiple send is not supported for this provider.')
+
+    data = request.get_json(force=True)
+    valid_public_id(draft_id)
+
+    body = data.get('body')
+    send_to = get_recipients([data.get('send_to')], 'to')[0]
+    draft = get_sending_draft(draft_id, g.namespace.id, g.db_session)
+
+    if not draft.is_sending:
+        raise InputError('Invalid draft, not part of a multi-send transaction')
+
+    emails = {email for name, email in itertools.chain(draft.to_addr,
+                                                       draft.cc_addr,
+                                                       draft.bcc_addr)}
+    if send_to[1] not in emails:
+        raise InputError('Invalid send_to, not present in message recipients')
+
+    if time.time() - request_started > SEND_TIMEOUT:
+        # Preemptively time out the request if we got stuck doing database work
+        # -- we don't want clients to disconnect and then still send the
+        # message.
+        return err(504, 'Request timed out.')
+
+    start_time = time.time()
+
+    # Send a copy of the draft with the new body to the send_to address
+    resp = send_draft_copy(account, draft, body, send_to)
+
+    request.environ['log_context']["time_to_send"] = time.time() - start_time
+
+    return resp
+
+
+@app.route('/send-multiple/<draft_id>', methods=['DELETE'])
+def multi_send_finish(draft_id):
+    """Closes out a multi-send session by marking the sending draft as sent
+    and moving it to the user's Sent folder."""
+
+    account = g.namespace.account
+
+    if account.discriminator == 'easaccount':
+        raise InputError('Multiple send is not supported for this provider.')
+
+    valid_public_id(draft_id)
+
+    draft = get_sending_draft(draft_id, g.namespace.id, g.db_session)
+    if not draft.is_sending:
+        raise InputError('Invalid draft, not part of a multi-send transaction')
+
+    # Synchronously delete any matching messages from the sent folder, left
+    # over from the send calls (in gmail only)
+    if not isinstance(account, GenericAccount):
+        try:
+            with writable_connection_pool(account.id).get() as crispin_client:
+                remote_delete_sent(crispin_client, account.id,
+                                   draft.message_id_header,
+                                   delete_multiple=True)
+        except Exception:
+            # Even if this fails, we need to finish off the multi-send session
+            log_exception(sys.exc_info(), draft_public_id=draft.public_id)
+
+    # Mark the draft as sent in our database
+    update_draft_on_send(account, draft, g.db_session)
+
+    # Save the sent message with its existing body to the user's sent folder
+    schedule_action('save_sent_email', draft, draft.namespace.id, g.db_session)
+
+    return g.encoder.jsonify(draft)
 
 
 ##
@@ -1260,23 +1556,32 @@ def sync_deltas():
     # - Begin shim -
     # Remove after folders and labels exposed in the Delta API for everybody,
     # right now, only expose for Edgehill.
+    # Same for the account object.
     g.parser.add_argument('exclude_folders', type=strict_bool, location='args')
+    g.parser.add_argument('exclude_account', type=strict_bool, location='args',
+                          default=True)
     # - End shim -
+    # Metadata has restricted access - only N1 can make a request with this
+    # arg included. For everyone else, set exclude_metadata to True by default.
+    g.parser.add_argument('exclude_metadata', type=strict_bool,
+                          location='args', default=True)
     args = strict_parse_args(g.parser, request.args)
     exclude_types = args.get('exclude_types')
     include_types = args.get('include_types')
     expand = args.get('view') == 'expanded'
+    exclude_metadata = args.get('exclude_metadata')
     # - Begin shim -
     exclude_folders = args.get('exclude_folders')
     if exclude_folders is None:
         exclude_folders = True
+    exclude_account = args.get('exclude_account')
     # - End shim -
     cursor = args['cursor']
     timeout = args['timeout']
 
     if include_types and exclude_types:
-        return err(400, "Invalid Request. Cannot specify both include_types"
-                   "and exclude_types")
+        raise InputError("Invalid Request. Cannot specify both include_types"
+                         "and exclude_types")
 
     if cursor == '0':
         start_pointer = 0
@@ -1289,15 +1594,17 @@ def sync_deltas():
             raise InputError('Invalid cursor parameter')
 
     # The client wants us to wait until there are changes
+    g.db_session.expunge(g.namespace)
     g.db_session.close()  # hack to close the flask session
-    poll_interval = 1
+    poll_interval = LONG_POLL_POLL_INTERVAL
 
     start_time = time.time()
     while time.time() - start_time < timeout:
         with session_scope(g.namespace.id) as db_session:
             deltas, _ = delta_sync.format_transactions_after_pointer(
                 g.namespace, start_pointer, db_session, args['limit'],
-                exclude_types, include_types, exclude_folders, expand=expand)
+                exclude_types, include_types, exclude_folders,
+                exclude_metadata, exclude_account, expand=expand)
 
         response = {
             'cursor_start': cursor,
@@ -1367,8 +1674,15 @@ def stream_changes():
     # - Begin shim -
     # Remove after folders and labels exposed in the Delta API for everybody,
     # right now, only expose for Edgehill.
+    # Same for the account object.
     g.parser.add_argument('exclude_folders', type=strict_bool, location='args')
+    g.parser.add_argument('exclude_account', type=strict_bool, location='args',
+                          default=True)
     # - End shim -
+    # Metadata has restricted access - only N1 can make a request with this
+    # arg included. For everyone else, set exclude_metadata to True by default.
+    g.parser.add_argument('exclude_metadata', type=strict_bool,
+                          location='args', default=True)
 
     args = strict_parse_args(g.parser, request.args)
     timeout = args['timeout'] or 1800
@@ -1377,16 +1691,18 @@ def stream_changes():
     exclude_types = args.get('exclude_types')
     include_types = args.get('include_types')
     expand = args.get('view') == 'expanded'
+    exclude_metadata = args.get('exclude_metadata')
 
     # Begin shim #
     exclude_folders = args.get('exclude_folders')
     if exclude_folders is None:
         exclude_folders = True
+    exclude_account = args.get('exclude_account')
     # End shim #
 
     if include_types and exclude_types:
-        return err(400, "Invalid Request. Cannot specify both include_types"
-                   "and exclude_types")
+        raise InputError("Invalid Request. Cannot specify both include_types"
+                         "and exclude_types")
 
     if cursor == '0':
         transaction_pointer = 0
@@ -1405,11 +1721,15 @@ def stream_changes():
 
     poll_interval = config.get('STREAMING_API_POLL_INTERVAL', 1)
     # TODO make transaction log support the `expand` feature
+
+    is_n1 = request.environ.get('IS_N1', False)
     generator = delta_sync.streaming_change_generator(
         g.namespace, transaction_pointer=transaction_pointer,
         poll_interval=poll_interval, timeout=timeout,
         exclude_types=exclude_types, include_types=include_types,
-        exclude_folders=exclude_folders, expand=expand)
+        exclude_folders=exclude_folders,
+        exclude_metadata=exclude_metadata, exclude_account=exclude_account,
+        expand=expand, is_n1=is_n1)
     return Response(stream_with_context(generator),
                     mimetype='text/event-stream')
 

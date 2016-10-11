@@ -1,13 +1,17 @@
+# flake8: noqa: F401, F811
 from datetime import datetime, timedelta
 import pytest
 from sqlalchemy import desc
+import gevent
+from gevent.lock import Semaphore
 from sqlalchemy.orm.exc import ObjectDeletedError
 from inbox.crispin import GmailFlags
 from inbox.mailsync.backends.imap.common import (remove_deleted_uids,
                                                  update_metadata)
-from inbox.mailsync.gc import DeleteHandler
-from inbox.models import Folder, Transaction
+from inbox.mailsync.gc import DeleteHandler, LabelRenameHandler
+from inbox.models import Folder, Message, Transaction
 from inbox.models.label import Label
+from inbox.util.testutils import mock_imapclient, MockIMAPClient
 from tests.util.base import add_fake_imapuid, add_fake_message
 
 
@@ -52,7 +56,7 @@ def test_deleting_from_a_message_with_multiple_uids(db, default_account,
     inbox_folder = Folder.find_or_create(db.session, default_account, 'inbox',
                                          'inbox')
     sent_folder = Folder.find_or_create(db.session, default_account, 'sent',
-                                         'sent')
+                                        'sent')
 
     add_fake_imapuid(db.session, default_account.id, message, sent_folder,
                      1337)
@@ -167,24 +171,24 @@ def test_deletion_creates_revision(db, default_account, default_namespace,
     assert latest_thread_transaction.command == 'delete'
 
 
-def test_deleted_labels_get_gced(db, default_account, thread, message,
+def test_deleted_labels_get_gced(empty_db, default_account, thread, message,
                                  imapuid, folder):
     # Check that only the labels without messages attached to them
     # get deleted.
-
     default_namespace = default_account.namespace
 
     # Create a label w/ no messages attached.
-    label = Label.find_or_create(db.session, default_account, 'dangling label')
+    label = Label.find_or_create(empty_db.session, default_account,
+                                 'dangling label')
     label.deleted_at = datetime.utcnow()
     label.category.deleted_at = datetime.utcnow()
     label_id = label.id
-    db.session.commit()
+    empty_db.session.commit()
 
     # Create a label with attached messages.
     msg_uid = imapuid.msg_uid
     update_metadata(default_account.id, folder.id, folder.canonical_name,
-                    {msg_uid: GmailFlags((), ('label',), None)}, db.session)
+                    {msg_uid: GmailFlags((), ('label',), None)}, empty_db.session)
 
     label_ids = []
     for cat in message.categories:
@@ -197,12 +201,70 @@ def test_deleted_labels_get_gced(db, default_account, thread, message,
                             uid_accessor=lambda m: m.imapuids,
                             message_ttl=0)
     handler.gc_deleted_categories()
-    db.session.commit()
+    empty_db.session.commit()
 
     # Check that the first label got gc'ed
-    marked_deleted = db.session.query(Label).get(label_id)
+    marked_deleted = empty_db.session.query(Label).get(label_id)
     assert marked_deleted is None
 
     # Check that the other labels didn't.
     for label_id in label_ids:
-        assert db.session.query(Label).get(label_id) is not None
+        assert empty_db.session.query(Label).get(label_id) is not None
+
+
+def test_renamed_label_refresh(db, default_account, thread, message,
+                               imapuid, folder, mock_imapclient, monkeypatch):
+    # Check that imapuids see their labels refreshed after running
+    # the LabelRenameHandler.
+    msg_uid = imapuid.msg_uid
+    uid_dict = {msg_uid: GmailFlags((), ('stale label',), ('23',))}
+
+    update_metadata(default_account.id, folder.id, folder.canonical_name,
+                    uid_dict, db.session)
+
+    new_flags = {msg_uid: {'FLAGS': ('\\Seen',), 'X-GM-LABELS': ('new label',),
+                           'MODSEQ': ('23',)}}
+    mock_imapclient._data['[Gmail]/All mail'] = new_flags
+
+    mock_imapclient.add_folder_data(folder.name, new_flags)
+
+    monkeypatch.setattr(MockIMAPClient, 'search',
+                        lambda x, y: [msg_uid])
+
+    semaphore = Semaphore(value=1)
+
+    rename_handler = LabelRenameHandler(default_account.id,
+                                        default_account.namespace.id,
+                                        'new label', semaphore)
+
+    # Acquire the semaphore to check that LabelRenameHandlers block if
+    # the semaphore is in-use.
+    semaphore.acquire()
+    rename_handler.start()
+
+    gevent.sleep(0)  # yield to the handler
+
+    labels = list(imapuid.labels)
+    assert len(labels) == 1
+    assert labels[0].name == 'stale label'
+    semaphore.release()
+    rename_handler.join()
+
+    db.session.refresh(imapuid)
+    # Now check that the label got updated.
+    labels = list(imapuid.labels)
+    assert len(labels) == 1
+    assert labels[0].name == 'new label'
+
+
+def test_reply_to_message_cascade(db, default_namespace, thread, message):
+    reply = add_fake_message(db.session, default_namespace.id, thread)
+    reply.reply_to_message = message
+    db.session.commit()
+
+    db.session.expire_all()
+    db.session.delete(message)
+    db.session.commit()
+
+    assert db.session.query(Message).filter(Message.id == message.id).all() == []
+    assert db.session.query(Message).filter(Message.id == reply.id).all() == [reply]

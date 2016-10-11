@@ -17,7 +17,7 @@ from inbox.models import Contact
 from inbox.models.backends.gmail import GmailAccount, g_token_manager
 from inbox.models.backends.gmail import GmailAuthCredentials
 
-SOURCE_APP_NAME = 'Nilas Sync Engine'
+SOURCE_APP_NAME = 'Nylas Sync Engine'
 
 
 class GoogleContactsProvider(object):
@@ -100,7 +100,7 @@ class GoogleContactsProvider(object):
         Returns
         -------
         ..models.tables.base.Contact
-            A corresponding Inbox Contact instance.
+            A corresponding Nylas Contact instance.
 
         Raises
         ------
@@ -110,8 +110,9 @@ class GoogleContactsProvider(object):
         email_addresses = [email for email in google_contact.email if
                            email.primary]
         if email_addresses and len(email_addresses) > 1:
-            self.log.error("Should not have more than one email per entry! {0}"
-                           .format(email_addresses))
+            self.log.error("Should not have more than one email per entry!",
+                           num_email=len(email_addresses))
+
         try:
             # The id.text field of a ContactEntry object takes the form
             # 'http://www.google.com/m8/feeds/contacts/<useremail>/base/<uid>'.
@@ -179,9 +180,14 @@ class GoogleContactsProvider(object):
                 return [self._parse_contact_result(result) for result in
                         results]
             except gdata.client.RequestError as e:
-                self.log.info('contact sync request failure; retrying',
-                              message=e)
-                gevent.sleep(30 + random.randrange(0, 60))
+                if e.status == 503:
+                    self.log.info('Ran into Google bot detection. Sleeping.',
+                                  message=e)
+                    gevent.sleep(5 * 60 + random.randrange(0, 60))
+                else:
+                    self.log.info('contact sync request failure; retrying',
+                                  message=e)
+                    gevent.sleep(30 + random.randrange(0, 60))
             except gdata.client.Unauthorized:
                 self.log.warning(
                     'Invalid access token; refreshing and retrying')

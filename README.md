@@ -1,8 +1,8 @@
-# Nylas Sync Engine
+# Nylas Sync Engine [![Build Status](https://travis-ci.org/nylas/sync-engine.svg?branch=master)](https://travis-ci.org/nylas/sync-engine)
 
 The Nylas Sync Engine provides a RESTful API on top of a powerful email sync platform, making it easy to build apps on top of email. See the [full API documentation](https://www.nylas.com/docs/) for more details.
 
-[Join our Slack channel ![Slack Invite Button](http://slack-invite.nylas.com/badge.svg)](http://slack-invite.nylas.com)
+Need help? [Join our Slack channel ![Slack Invite Button](http://slack-invite.nylas.com/badge.svg)](http://slack-invite.nylas.com)
 
 
 ### Installation and Setup
@@ -21,7 +21,7 @@ The Nylas Sync Engine provides a RESTful API on top of a powerful email sync pla
 
 6. `cd /vagrant`
 
-7. `bin/inbox-start`
+7. `NYLAS_ENV=dev bin/inbox-start`
 
 And _voilà_! Auth an account via the commandline to start syncing:
 
@@ -35,8 +35,7 @@ The sync engine will automatically begin syncing your account with the underlyin
 
 The Nylas API service provides a REST API for interacting with your data. To start it in your development environment, run command below from the `/vagrant` folder within your VM:
 
-```
-:::bash
+```bash
 $ bin/inbox-api
 ```
 
@@ -46,7 +45,9 @@ You can get a list of all connected accounts by requesting `http://localhost:555
 
 For subsequent requests to retreive mail, contacts, and calendar data, your app should pass the `account_id` value from the previous step as the "username" parameter in HTTP Basic auth. For example:
 
-`curl --user 'ACCOUNT_ID_VALUE_HERE:' http://localhost:5555/threads
+```
+curl --user 'ACCOUNT_ID_VALUE_HERE:' http://localhost:5555/threads
+```
 
 If you are using a web browser and would like to clear your cached HTTP Basic Auth values, simply visit http://localhost:5555/logout and click "Cancel".
 
@@ -56,7 +57,7 @@ Now you can start writing your own application on top of the Nylas API! For more
 
 ## Production Support
 
-We provide a fully manged and supported version of the Nylas sync engine for production apps. Read more at https://nylas.com
+We provide a fully managed and supported version of the Nylas sync engine for production apps. Read more at https://nylas.com
 
 ## Pull Requests
 
@@ -64,6 +65,10 @@ We'd love your help making Nylas better! Please sign-up for a [developer account
 
 We require all authors sign our [Contributor License Agreement](https://www.nylas.com/cla.html) when submitting pull requests. (It's similar to other projects, like NodeJS or Meteor.)
 
+## Security
+
+For the sake of simplicity and setup speed, the development VM does not include any authentication or permission. For developing with sensitive data, we encourage developers to add their own protection, such as only running Nylas on a local machine or behind a controlled firewall.
+Note that passwords and OAuth tokens are stored unencrypted in the local MySQL data store on disk. This is intentional, for the same reason as above.
 
 ## License
 

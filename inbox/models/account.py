@@ -1,4 +1,5 @@
 import os
+import traceback
 from datetime import datetime
 
 from sqlalchemy import (Column, BigInteger, String, DateTime, Boolean,
@@ -9,14 +10,19 @@ from sqlalchemy.sql.expression import false
 from inbox.sqlalchemy_ext.util import JSON, MutableDict, bakery
 
 from inbox.models.mixins import (HasPublicID, HasEmailAddress, HasRunState,
-                                 HasRevisions)
+                                 HasRevisions, UpdatedAtMixin,
+                                 DeletedAtMixin)
 from inbox.models.base import MailSyncBase
 from inbox.models.calendar import Calendar
 from inbox.providers import provider_info
 
 
+# Note, you should never directly create Account objects. Instead you
+# should use objects that inherit from this, such as GenericAccount or
+# GmailAccount
+
 class Account(MailSyncBase, HasPublicID, HasEmailAddress, HasRunState,
-              HasRevisions):
+              HasRevisions, UpdatedAtMixin, DeletedAtMixin):
     API_OBJECT_NAME = 'account'
 
     @property
@@ -55,7 +61,7 @@ class Account(MailSyncBase, HasPublicID, HasEmailAddress, HasRunState,
 
     @property
     def provider_info(self):
-        return provider_info(self.provider, self.email_address)
+        return provider_info(self.provider)
 
     @property
     def thread_cls(self):
@@ -170,7 +176,14 @@ class Account(MailSyncBase, HasPublicID, HasEmailAddress, HasRunState,
         return (self.initial_sync_end - self.initial_sync_end).total_seconds()
 
     def update_sync_error(self, error=None):
-        self._sync_status['sync_error'] = error
+        if error is None:
+            self._sync_status['sync_error'] = None
+        else:
+            error_obj = {
+                'message': str(error.message),
+                'traceback': traceback.format_exc(20)}
+
+            self._sync_status['sync_error'] = error_obj
 
     def sync_started(self):
         """
@@ -189,6 +202,9 @@ class Account(MailSyncBase, HasPublicID, HasEmailAddress, HasRunState,
         self._sync_status['sync_start_time'] = current_time
         self._sync_status['sync_end_time'] = None
         self._sync_status['sync_error'] = None
+        self._sync_status['sync_disabled_reason'] = None
+        self._sync_status['sync_disabled_on'] = None
+        self._sync_status['sync_disabled_by'] = None
 
         self.sync_state = 'running'
 
@@ -223,26 +239,28 @@ class Account(MailSyncBase, HasPublicID, HasEmailAddress, HasRunState,
 
     def mark_deleted(self):
         """
-        Soft-delete the account.
+        Mark account for deletion
         """
         self.disable_sync('account deleted')
+        self.sync_state = 'stopped'
 
-    def sync_stopped(self, reason=None):
+    def sync_stopped(self, requesting_host):
         """
         Record transition to stopped state. Should be called after the
         sync is actually stopped, not when the request to stop it is made.
 
         """
-        if self.sync_state == 'running':
-            self.sync_state = 'stopped'
-        self.sync_host = None
-        self._sync_status['sync_end_time'] = datetime.utcnow()
-
-    def kill_sync(self, error=None):
-        # Don't disable sync: syncs are not killed on purpose.
-        self.sync_state = 'killed'
-        self._sync_status['sync_end_time'] = datetime.utcnow()
-        self._sync_status['sync_error'] = error
+        if requesting_host == self.sync_host:
+            # Perform a compare-and-swap before updating these values.
+            # Only if the host requesting to update the account.sync_* attributes
+            # here still owns the account sync (i.e is account.sync_host),
+            # the request can proceed.
+            self.sync_host = None
+            if self.sync_state == 'running':
+                self.sync_state = 'stopped'
+            self._sync_status['sync_end_time'] = datetime.utcnow()
+            return True
+        return False
 
     @classmethod
     def get(cls, id_, session):
@@ -270,6 +288,10 @@ class Account(MailSyncBase, HasPublicID, HasEmailAddress, HasRunState,
         obj_state = inspect(self)
         return not (obj_state.pending or
                     inspect(self).attrs.sync_state.history.has_changes())
+
+    @property
+    def server_settings(self):
+        return None
 
     discriminator = Column('type', String(16))
     __mapper_args__ = {'polymorphic_identity': 'account',

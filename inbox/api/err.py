@@ -1,8 +1,48 @@
-from flask import jsonify, make_response
+import sys
+import traceback
+
+from flask import jsonify, make_response, request
+from nylas.logging.sentry import sentry_alert
+from nylas.logging.log import get_logger, create_error_log_context
+log = get_logger()
+
+from inbox.config import is_live_env
+
+
+def get_request_uid(headers):
+    return headers.get('X-Unique-ID')
+
+
+def log_exception(exc_info, send_to_sentry=True, **kwargs):
+    """ Add exception info to the log context for the request.
+
+    We do not log in a separate log statement in order to make debugging
+    easier. As a bonus, this reduces log volume somewhat.
+
+    """
+    if send_to_sentry:
+        sentry_alert()
+
+    if not is_live_env():
+        print
+        traceback.print_exc()
+        print
+
+    new_log_context = create_error_log_context(exc_info)
+    new_log_context.update(kwargs)
+
+    # guard against programming errors overriding log fields (confusing!)
+    if set(new_log_context.keys()).intersection(
+            set(request.environ.get('log_context', {}))):
+        log.warning("attempt to log more than one error to HTTP request",
+                    request_uid=get_request_uid(request.headers),
+                    **new_log_context)
+    else:
+        request.environ.setdefault('log_context', {}).update(new_log_context)
 
 
 class APIException(Exception):
-    pass
+    status_code = 500
 
 
 class InputError(APIException):
@@ -12,6 +52,7 @@ class InputError(APIException):
 
     def __init__(self, message):
         self.message = message
+        super(InputError, self).__init__(message)
 
 
 class NotFoundError(APIException):
@@ -20,6 +61,7 @@ class NotFoundError(APIException):
 
     def __init__(self, message):
         self.message = message
+        super(NotFoundError, self).__init__(message)
 
 
 class ConflictError(APIException):
@@ -27,18 +69,34 @@ class ConflictError(APIException):
 
     def __init__(self, message):
         self.message = message
+        super(ConflictError, self).__init__(message)
 
 
-class ActionError(APIException):
-    """Raised when an account's credentials aren't valid. (We don't accept
-    actions if they can't be synced back."""
+class AccountInvalidError(APIException):
+    """ Raised when an account's credentials are not valid. """
     status_code = 403
     message = "This action can't be performed because the account's " \
               "credentials are out of date. Please reauthenticate and try " \
               "again."
 
 
+class AccountStoppedError(APIException):
+    """ Raised when an account has been stopped. """
+    status_code = 403
+    message = "This action can't be performed because the account's sync " \
+              "has been stopped. Please contact support@nylas.com to resume " \
+              "sync."
+
+
+class AccountDoesNotExistError(APIException):
+    """ Raised when an account does not exist (for example, if it was deleted). """
+    status_code = 404
+    message = "The account does not exist."
+
+
 def err(http_code, message, **kwargs):
+    """ Handle unexpected errors, including sending the traceback to Sentry. """
+    log_exception(sys.exc_info(), user_error_message=message, **kwargs)
     resp = {
         'type': 'api_error',
         'message': message

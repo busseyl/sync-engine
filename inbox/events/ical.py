@@ -1,9 +1,12 @@
 import sys
 import pytz
 import arrow
-import traceback
+import requests
 import icalendar
+import traceback
+from inbox.config import config
 from icalendar import Calendar as iCalendar
+from email.utils import formataddr
 from datetime import datetime, date
 
 from flanker import mime
@@ -98,25 +101,25 @@ def events_from_ics(namespace, calendar, ics_str):
 
             # Get the last modification date.
             # Exchange uses DtStamp, iCloud and Gmail LAST-MODIFIED.
-            last_modified_tstamp = component.get('dtstamp')
+            component_dtstamp = component.get('dtstamp')
+            component_last_modified = component.get('last-modified')
             last_modified = None
-            if last_modified_tstamp is not None:
+
+            if component_dtstamp is not None:
                 # This is one surprising instance of Exchange doing
                 # the right thing by giving us an UTC timestamp. Also note that
                 # Google calendar also include the DtStamp field, probably to
                 # be a good citizen.
-                if last_modified_tstamp.dt.tzinfo is not None:
-                    last_modified = last_modified_tstamp.dt
+                if component_dtstamp.dt.tzinfo is not None:
+                    last_modified = component_dtstamp.dt
                 else:
                     raise NotImplementedError("We don't support arcane Windows"
                                               " timezones in timestamps yet")
-            else:
+            elif component_last_modified is not None:
                 # Try to look for a LAST-MODIFIED element instead.
                 # Note: LAST-MODIFIED is always in UTC.
                 # http://www.kanzaki.com/docs/ical/lastModified.html
-                last_modified = component.get('last-modified').dt
-                assert last_modified is not None, \
-                    "Event should have a DtStamp or LAST-MODIFIED timestamp"
+                last_modified = component_last_modified.dt
 
             title = None
             summaries = component.get('summary', [])
@@ -166,13 +169,14 @@ def events_from_ics(namespace, calendar, ics_str):
                 if 'CN' in organizer.params:
                     organizer_name = organizer.params['CN']
 
-            owner = u"{} <{}>".format(organizer_name, organizer_email)
-
-            if (namespace.account.email_address ==
-                    canonicalize_address(organizer_email)):
-                is_owner = True
+                owner = formataddr([organizer_name, organizer_email])
             else:
-                is_owner = False
+                owner = None
+
+            is_owner = False
+            if owner is not None and (namespace.account.email_address ==
+                                      canonicalize_address(organizer_email)):
+                is_owner = True
 
             attendees = component.get('attendee', [])
 
@@ -389,7 +393,7 @@ def import_attached_events(db_session, account, message):
             log.error('Attached event parsing error',
                       account_id=account.id, message_id=message.id,
                       logstash_tag='icalendar_autoimport',
-                      invite=part.block.data)
+                      event_part_id=part.id)
             continue
         except (AssertionError, TypeError, RuntimeError,
                 AttributeError, ValueError, UnboundLocalError,
@@ -398,7 +402,7 @@ def import_attached_events(db_session, account, message):
             # creation because of an error in the attached calendar.
             log.error('Unhandled exception during message parsing',
                       message_id=message.id,
-                      invite=part_data,
+                      event_part_id=part.id,
                       logstash_tag='icalendar_autoimport',
                       traceback=traceback.format_exception(
                           sys.exc_info()[0],
@@ -500,36 +504,24 @@ def generate_invite_message(ical_txt, event, account, invite_type='request'):
 
     body = mime.create.multipart('alternative')
 
-    # Why do we have a switch here? Because Exchange silently drops messages
-    # which look too similar. Switching the order of headers seems to work.
-    #
-    # Oh, also Exchange strips our iCalendar file, so we add it as an
-    # attachment to make sure it makes it through. Luckily, Gmail is smart
-    # enough to cancel the event anyway.
-    # - karim
     if invite_type in ['request', 'update']:
         body.append(
             mime.create.text('plain', text_body),
             mime.create.text('html', html_body),
-            mime.create.text('calendar; method=REQUEST'.format(invite_type),
+            mime.create.text('calendar; method=REQUEST',
                              ical_txt, charset='utf8'))
         msg.append(body)
     elif invite_type == 'cancel':
         body.append(
-            mime.create.text('html', html_body),
             mime.create.text('plain', text_body),
-            mime.create.text('calendar; method=CANCEL'.format(invite_type),
+            mime.create.text('html', html_body),
+            mime.create.text('calendar; method=CANCEL',
                              ical_txt, charset='utf8'))
         msg.append(body)
 
-        attachment = mime.create.attachment(
-            'application/ics',
-            ical_txt,
-            'invite.ics',
-            disposition='attachment')
-        msg.append(attachment)
-
-    msg.headers['From'] = account.email_address
+    # From should match our mailsend provider (mailgun) so it doesn't confuse
+    # spam filters
+    msg.headers['From'] = "notifications@mg.nylas.com"
     msg.headers['Reply-To'] = account.email_address
 
     if invite_type == 'request':
@@ -543,7 +535,10 @@ def generate_invite_message(ical_txt, event, account, invite_type='request'):
 
 
 def send_invite(ical_txt, event, account, invite_type='request'):
-    from inbox.sendmail.base import get_sendmail_client, SendMailException
+    # We send those transactional emails through a separate domain.
+    MAILGUN_API_KEY = config.get('NOTIFICATIONS_MAILGUN_API_KEY')
+    MAILGUN_DOMAIN = config.get('NOTIFICATIONS_MAILGUN_DOMAIN')
+    assert MAILGUN_DOMAIN is not None and MAILGUN_API_KEY is not None
 
     for participant in event.participants:
         email = participant.get('email', None)
@@ -554,21 +549,15 @@ def send_invite(ical_txt, event, account, invite_type='request'):
         msg.headers['To'] = email
         final_message = msg.to_string()
 
-        try:
-            sendmail_client = get_sendmail_client(account)
-            sendmail_client.send_generated_email([email], final_message)
-        except SendMailException as e:
+        mg_url = 'https://api.mailgun.net/v3/{}/messages.mime'.format(MAILGUN_DOMAIN)
+        r = requests.post(mg_url, auth=("api", MAILGUN_API_KEY),
+                          data={"to": email},
+                          files={"message": final_message})
+
+        if r.status_code != 200:
             log.error("Couldnt send invite email for", email_address=email,
                       event_id=event.id, account_id=account.id,
-                      logstash_tag='invite_sending', exception=str(e))
-
-        if (account.provider == 'eas' and not account.outlook_account
-                and invite_type in ['request', 'update']):
-            # Exchange very surprisingly goes out of the way to send an invite
-            # to all participants (though Outlook.com doesn't).
-            # We only do this for invites and not cancelled because Exchange
-            # doesn't parse our cancellation messages as invites.
-            break
+                      logstash_tag='invite_sending', status_code=r.status_code)
 
 
 def _generate_rsvp(status, account, event):
@@ -584,10 +573,8 @@ def _generate_rsvp(status, account, event):
     icalevent = icalendar.Event()
     icalevent['uid'] = event.uid
 
-    # For ahem, 'historic reasons', we're saving the owner field
-    # as "Organizer <organizer@nylas.com>".
-    organizer_name, organizer_email = event.owner.split('<')
-    organizer_email = organizer_email[:-1]
+    if event.organizer_email is not None:
+        icalevent['organizer'] = event.organizer_email
 
     icalevent['sequence'] = event.sequence_number
     icalevent['X-MICROSOFT-CDO-APPT-SEQUENCE'] = icalevent['sequence']
@@ -621,7 +608,6 @@ def _generate_rsvp(status, account, event):
 
     ret = {}
     ret["cal"] = cal
-    ret["organizer_email"] = organizer_email
 
     return ret
 
@@ -632,12 +618,37 @@ def generate_rsvp(event, participant, account):
     return _generate_rsvp(status, account, event)
 
 
+# Get the email address we should be RSVPing to.
+# We try to find the organizer address from the iCal file.
+# If it's not defined, we try to return the invite sender's
+# email address.
+def rsvp_recipient(event):
+    if event is None:
+        return None
+
+    # A stupid bug made us create some db entries of the
+    # form "None <None>".
+    if event.organizer_email not in [None, 'None']:
+        return event.organizer_email
+
+    if event.message is not None:
+        if event.message.from_addr is not None and len(event.message.from_addr) == 1:
+            from_addr = event.message.from_addr[0][1]
+            if from_addr is not None and from_addr != '':
+                return from_addr
+
+    return None
+
+
 def send_rsvp(ical_data, event, body_text, status, account):
     from inbox.sendmail.base import get_sendmail_client, SendMailException
 
     ical_file = ical_data["cal"]
-    rsvp_to = ical_data["organizer_email"]
     ical_txt = ical_file.to_ical()
+    rsvp_to = rsvp_recipient(event)
+
+    if rsvp_to is None:
+        raise SendMailException("Couldn't find an organizer to RSVP to.")
 
     sendmail_client = get_sendmail_client(account)
 
@@ -652,18 +663,7 @@ def send_rsvp(ical_data, event, body_text, status, account):
 
     msg.headers['Reply-To'] = account.email_address
     msg.headers['From'] = account.email_address
-
-    # Send the reply to the invite organizer. If it's not defined,
-    # default to the invite from field.
-    if event.organizer_email is not None:
-        msg.headers['To'] = event.organizer_email
-    else:
-        if event.message.from_addr is not None and len(event.message.from_addr) == 1:
-            from_addr = event.message.from_addr[0][1]
-            msg.headers['To'] = from_addr
-        else:
-            # Couldn't find an organizer. Bailing out.
-            raise SendMailException("Couldn't find an event organizer to RSVP to.")
+    msg.headers['To'] = rsvp_to
 
     assert status in ['yes', 'no', 'maybe']
 

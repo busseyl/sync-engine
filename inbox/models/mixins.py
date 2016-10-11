@@ -7,6 +7,7 @@ from sqlalchemy.ext.hybrid import hybrid_property, Comparator
 from inbox.sqlalchemy_ext.util import Base36UID, generate_public_id, ABCMixin
 from inbox.models.constants import MAX_INDEXABLE_LENGTH
 from inbox.util.addr import canonicalize_address
+from inbox.util.encoding import unicode_safe_truncate
 
 
 class HasRevisions(ABCMixin):
@@ -88,6 +89,9 @@ class AddressComparator(Comparator):
     def like(self, term, escape=None):
         return self.__clause_element__().like(term, escape=escape)
 
+    def in_(self, addresses):
+        return self.__clause_element__().in_(map(canonicalize_address, addresses))
+
 
 class CaseInsensitiveComparator(Comparator):
 
@@ -123,25 +127,26 @@ class HasEmailAddress(object):
 
     @email_address.setter
     def email_address(self, value):
+        # Silently truncate if necessary. In practice, this may be too
+        # long if somebody put a super-long email into their contacts by
+        # mistake or something.
         if value is not None:
-            # Silently truncate if necessary. In practice, this may be too
-            # long if somebody put a super-long email into their contacts by
-            # mistake or something.
-            value = value[:MAX_INDEXABLE_LENGTH]
+            value = unicode_safe_truncate(value, MAX_INDEXABLE_LENGTH)
         self._raw_address = value
         self._canonicalized_address = canonicalize_address(value)
 
 
-class AutoTimestampMixin(object):
-    # We do all default/update in Python not SQL for these because MySQL
-    # < 5.6 doesn't support multiple TIMESTAMP cols per table, and can't
-    # do function defaults or update triggers on DATETIME rows.
+class CreatedAtMixin(object):
     created_at = Column(DateTime, default=datetime.utcnow,
                         nullable=False, index=True)
+
+
+class UpdatedAtMixin(object):
     updated_at = Column(DateTime, default=datetime.utcnow,
                         onupdate=datetime.utcnow, nullable=False, index=True)
-    # MOSTLY DEPRECATED (but currently used for async deletion of Message
-    # objects).
+
+
+class DeletedAtMixin(object):
     deleted_at = Column(DateTime, nullable=True, index=True)
 
 

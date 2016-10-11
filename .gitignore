@@ -1,4 +1,4 @@
-# Inbox-specific
+# Nylas-specific
 /packer_cache
 /log
 /man
@@ -15,6 +15,7 @@ node_modules
 /tests/log
 /tests/output
 /tests/coverage
+/tests/.cache
 htmlcov
 /cache
 /config.json
@@ -74,6 +75,7 @@ nosetests.xml
 # Editor temporary files
 *.swp
 *.swo
+*~
 
 # ctags
 tags

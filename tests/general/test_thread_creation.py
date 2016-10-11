@@ -1,12 +1,15 @@
+# flake8: noqa: F401
 # test that T441 doesn't reappear, ever.
 import datetime
 import pytest
 from collections import namedtuple
 from inbox.mailsync.backends.imap.generic import FolderSyncEngine
 from inbox.models import Folder, Namespace
+from inbox.models.backends.generic import GenericAccount
 from inbox.models.backends.imap import ImapUid
 from inbox.util.threading import fetch_corresponding_thread
-from tests.util.base import add_fake_thread, add_fake_message
+from tests.util.base import (add_fake_thread, add_fake_message,
+                             add_generic_imap_account)
 
 MockRawMessage = namedtuple('RawMessage', ['flags'])
 
@@ -35,10 +38,8 @@ def test_generic_grouping(db, default_account):
 
     thread = add_fake_thread(db.session, default_account.namespace.id)
 
-    new_namespace = Namespace()
-    db.session.add(new_namespace)
-    db.session.commit()
-    message = add_fake_message(db.session, new_namespace.id,
+    account = add_generic_imap_account(db.session)
+    message = add_fake_message(db.session, account.namespace.id,
                                thread, subject="Golden Gate Park next Sat")
 
     thread = fetch_corresponding_thread(db.session,

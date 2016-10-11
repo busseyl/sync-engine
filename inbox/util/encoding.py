@@ -16,3 +16,13 @@ def base36encode(number):
 
 def base36decode(number):
     return int(number, 36)
+
+
+def unicode_safe_truncate(s, max_length):
+    """
+    Implements unicode-safe truncation and trims whitespace for a given input
+    string, number or unicode string.
+    """
+    if not isinstance(s, unicode):
+        s = str(s).decode('utf-8', 'ignore')
+    return s.rstrip()[:max_length]

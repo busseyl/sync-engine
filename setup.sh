@@ -54,10 +54,10 @@ fi
 
 # Don't fail builds if apt-get update fails (eg due to ksplice being down)
 set +e
-apt-get update
+apt-get -qq update
 set -e
 
-apt-get -y install python-software-properties
+apt-get -qq -y install python-software-properties
 
 
 { \
@@ -86,7 +86,6 @@ apt-get -y install git \
                    libmysqlclient-dev \
                    gcc \
                    g++ \
-                   libzmq-dev \
                    libxml2-dev \
                    libxslt-dev \
                    lib32z1-dev \
@@ -97,6 +96,8 @@ apt-get -y install git \
                    curl \
                    tnef \
                    stow \
+                   lua5.2 \
+                   liblua5.2-dev \
 
 # Switch to a temporary directory to install dependencies, since the source
 # directory might be mounted from a VM host with weird permissions.
@@ -173,9 +174,9 @@ fi
 color '35;1' 'Ensuring setuptools and pip versions...'
 # If python-setuptools is actually the old 'distribute' fork of setuptools,
 # then the first 'pip install setuptools' will be a no-op.
-pip install 'pip>=1.5.6' 'setuptools>=5.3'
+pip install 'pip==8.1.2' 'setuptools>=5.3'
 hash pip        # /usr/bin/pip might now be /usr/local/bin/pip
-pip install 'pip>=1.5.6' 'setuptools>=5.3'
+pip install 'pip==8.1.2' 'setuptools>=5.3'
 
 # Doing pip upgrade setuptools leaves behind this problematic symlink
 rm -rf /usr/lib/python2.7/dist-packages/setuptools.egg-info
@@ -269,8 +270,8 @@ if ! $prod; then
     mysqld_safe &
     sleep 10
 
-    bin/create-db
-    bin/create-test-db
+    env NYLAS_ENV=dev bin/create-db
+    env NYLAS_ENV=dev bin/create-test-db
 fi
 
 if [[ $(mysql --version) != *"5.6"* ]]

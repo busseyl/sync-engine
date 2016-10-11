@@ -6,6 +6,10 @@ class AuthError(Exception):
     pass
 
 
+class SSLNotSupportedError(AuthError):
+    pass
+
+
 class ConnectionError(AuthError):
     pass
 
@@ -27,6 +31,10 @@ class ConfigError(Exception):
 
 
 class UserRecoverableConfigError(Exception):
+    pass
+
+
+class SettingUpdateError(Exception):
     pass
 
 

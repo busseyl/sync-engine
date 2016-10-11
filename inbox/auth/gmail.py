@@ -26,8 +26,8 @@ OAUTH_CLIENT_SECRET = config.get_required('GOOGLE_OAUTH_CLIENT_SECRET')
 OAUTH_REDIRECT_URI = config.get_required('GOOGLE_OAUTH_REDIRECT_URI')
 
 OAUTH_AUTHENTICATE_URL = 'https://accounts.google.com/o/oauth2/auth'
-OAUTH_ACCESS_TOKEN_URL = 'https://accounts.google.com/o/oauth2/token'
-OAUTH_TOKEN_VALIDATION_URL = 'https://www.googleapis.com/oauth2/v1/tokeninfo'
+OAUTH_ACCESS_TOKEN_URL = 'https://www.googleapis.com/oauth2/v4/token'
+OAUTH_TOKEN_VALIDATION_URL = 'https://www.googleapis.com/oauth2/v2/tokeninfo'
 OAUTH_USER_INFO_URL = 'https://www.googleapis.com/oauth2/v1/userinfo'
 
 # NOTE: urls for email address and G+ profile are deprecated
@@ -69,7 +69,7 @@ class GmailAuthHandler(OAuthAuthHandler):
                 raise exc
 
             log.error('Error during IMAP XOAUTH2 login',
-                      account_id=account.id, email=account.email_address,
+                      account_id=account.id,
                       host=host, port=port, error=exc)
             if not isinstance(exc, ImapSupportDisabledError):
                 raise  # Unknown IMAPClient error, reraise
@@ -104,6 +104,7 @@ class GmailAuthHandler(OAuthAuthHandler):
         # (redwood auth versus bin/inbox-auth)
         namespace = Namespace()
         account = GmailAccount(namespace=namespace)
+        account.create_emailed_events_calendar()
         return self.update_account(account, response)
 
     def update_account(self, account, response):
@@ -171,15 +172,45 @@ class GmailAuthHandler(OAuthAuthHandler):
             auth_creds.refresh_token = new_refresh_token
             auth_creds.is_valid = True
 
+        # Ensure account has sync enabled.
+        account.enable_sync()
+        return account
+
+    def verify_account(self, account):
+        """
+        Verify the credentials provided by logging in.
+        Verify the account configuration -- specifically checks for the presence
+        of the 'All Mail' folder.
+
+        Raises
+        ------
+        An inbox.crispin.GmailSettingError if the 'All Mail' folder is
+        not present and is required (account.sync_email == True).
+
+        """
         try:
-            self.verify_config(account)
+            # Verify login.
+            conn = self.connect_account(account)
+            # Verify configuration.
+            client = GmailCrispinClient(account.id,
+                                        provider_info('gmail'),
+                                        account.email_address,
+                                        conn,
+                                        readonly=True)
+            client.sync_folders()
+            conn.logout()
         except ImapSupportDisabledError:
             if account.sync_email:
                 raise
 
-        # Ensure account has sync enabled.
-        account.enable_sync()
-        return account
+        # Reset the sync_state to 'running' on a successful re-auth.
+        # Necessary for API requests to proceed and an account modify delta to
+        # be returned to delta/ streaming clients.
+        # NOTE: Setting this does not restart the sync. Sync scheduling occurs
+        # via the sync_should_run bit (set to True in update_account() above).
+        account.sync_state = ('running' if account.sync_state else
+                              account.sync_state)
+        return True
 
     def validate_token(self, access_token):
         response = requests.get(self.OAUTH_TOKEN_VALIDATION_URL,
@@ -191,23 +222,6 @@ class GmailAuthHandler(OAuthAuthHandler):
 
         return validation_dict
 
-    def verify_config(self, account):
-        """
-        Verifies configuration, specifically presence of 'All Mail' folder.
-        Will raise an inbox.crispin.GmailSettingError if not present.
-
-        """
-        conn = self.connect_account(account)
-        # make a crispin client and check the folders
-        client = GmailCrispinClient(account.id,
-                                    provider_info('gmail'),
-                                    account.email_address,
-                                    conn,
-                                    readonly=True)
-        client.sync_folders()
-        conn.logout()
-        return True
-
     def interactive_auth(self, email_address=None):
         url_args = {'redirect_uri': self.OAUTH_REDIRECT_URI,
                     'client_id': self.OAUTH_CLIENT_ID,
@@ -218,7 +232,7 @@ class GmailAuthHandler(OAuthAuthHandler):
             url_args['login_hint'] = email_address
         url = url_concat(self.OAUTH_AUTHENTICATE_URL, url_args)
 
-        print 'To authorize Inbox, visit this URL and follow the directions:'
+        print 'To authorize Nylas, visit this URL and follow the directions:'
         print '\n{}'.format(url)
 
         while True:

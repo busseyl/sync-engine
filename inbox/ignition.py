@@ -5,7 +5,8 @@ from socket import gethostname
 from urllib import quote_plus as urlquote
 from sqlalchemy import create_engine, event
 
-from inbox.sqlalchemy_ext.util import ForceStrictMode
+from inbox.sqlalchemy_ext.util import (ForceStrictMode,
+                                       disabled_dubiously_many_queries_warning)
 from inbox.config import config
 from inbox.util.stats import statsd_client
 from nylas.logging import get_logger, find_first_app_frame_and_name
@@ -51,7 +52,8 @@ def engine(database_name, database_uri, pool_size=DB_POOL_SIZE,
                            pool_recycle=3600,
                            max_overflow=max_overflow,
                            connect_args={'charset': 'utf8mb4',
-                                         'waiter': gevent_waiter})
+                                         'waiter': gevent_waiter,
+                                         'connect_timeout': 60})
 
     @event.listens_for(engine, 'checkout')
     def receive_checkout(dbapi_connection, connection_record,
@@ -162,8 +164,8 @@ def init_db(engine, key=0):
         event.listen(table, 'after_create',
                      DDL('ALTER TABLE {tablename} AUTO_INCREMENT={increment}'.
                          format(tablename=table, increment=increment)))
-
-    MailSyncBase.metadata.create_all(engine)
+    with disabled_dubiously_many_queries_warning():
+        MailSyncBase.metadata.create_all(engine)
 
 
 def verify_db(engine, schema, key):
@@ -174,6 +176,11 @@ def verify_db(engine, schema, key):
 
     verified = set()
     for table in MailSyncBase.metadata.sorted_tables:
+        # ContactSearchIndexCursor does not need to be checked because there's
+        # only one row in the table
+        if str(table) == 'contactsearchindexcursor':
+            continue
+
         increment = engine.execute(query.format(schema, table)).scalar()
         if increment is not None:
             assert (increment >> 48) == key, \
@@ -192,3 +199,22 @@ def verify_db(engine, schema, key):
             parent = list(table.columns['id'].foreign_keys)[0].column.table
             assert parent in verified
         verified.add(table)
+
+
+def reset_invalid_autoincrements(engine, schema, key, dry_run=True):
+    from inbox.models.base import MailSyncBase
+
+    query = """SELECT AUTO_INCREMENT from information_schema.TABLES where
+    table_schema='{}' AND table_name='{}';"""
+
+    reset = set()
+    for table in MailSyncBase.metadata.sorted_tables:
+        increment = engine.execute(query.format(schema, table)).scalar()
+        if increment is not None:
+            if (increment >> 48) != key:
+                if not dry_run:
+                    reset_query = "ALTER TABLE {} AUTO_INCREMENT={}". \
+                        format(table, (key << 48) + 1)
+                    engine.execute(reset_query)
+                reset.add(str(table))
+    return reset

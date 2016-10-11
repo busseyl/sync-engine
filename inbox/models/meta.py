@@ -18,14 +18,15 @@ def load_models():
     from inbox.models.search import ContactSearchIndexCursor
     from inbox.models.secret import Secret
     from inbox.models.thread import Thread
-    from inbox.models.transaction import Transaction
+    from inbox.models.transaction import Transaction, AccountTransaction
     from inbox.models.when import When, Time, TimeSpan, Date, DateSpan
     from inbox.models.label import Label
     from inbox.models.category import Category
+    from inbox.models.metadata import Metadata
     exports = [Account, MailSyncBase, ActionLog, Block, Part,
                MessageContactAssociation, Contact, PhoneNumber, Calendar,
                DataProcessingCache, Event, Folder,
                Message, Namespace, ContactSearchIndexCursor, Secret,
                Thread, Transaction, When, Time, TimeSpan, Date, DateSpan,
-               Label, Category, MessageCategory]
+               Label, Category, MessageCategory, Metadata, AccountTransaction]
     return exports

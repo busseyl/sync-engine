@@ -1,8 +1,35 @@
 import random
-from tests.util.base import (add_fake_account, add_fake_thread, add_fake_message,
+import gevent
+from requests import Response
+from pytest import fixture
+from freezegun import freeze_time
+
+from tests.util.base import (add_generic_imap_account, add_fake_thread, add_fake_message,
                              add_fake_calendar, add_fake_event, add_fake_folder,
                              add_fake_imapuid, add_fake_gmail_account,
                              add_fake_contact, add_fake_msg_with_calendar_part)
+
+
+@fixture
+def patch_requests_throttle(monkeypatch):
+    def get(*args, **kwargs):
+        resp = Response()
+        resp.status_code = 500
+
+    monkeypatch.setattr(
+        'requests.get',
+        lambda *args, **kwargs: get())
+
+
+@fixture
+def patch_requests_no_throttle(monkeypatch):
+    def get(*args, **kwargs):
+        resp = Response()
+        resp.status_code = 500
+
+    monkeypatch.setattr(
+        'requests.get',
+        lambda *args, **kwargs: get())
 
 
 def random_range(start, end):
@@ -14,8 +41,8 @@ def add_completely_fake_account(db, email='test@nylas.com'):
     fake_account = add_fake_gmail_account(db.session, email_address=email)
     calendar = add_fake_calendar(db.session, fake_account.namespace.id)
     for i in random_range(1, 10):
-        ev = add_fake_event(db.session, fake_account.namespace.id,
-                            calendar=calendar, title='%s' % i)
+        add_fake_event(db.session, fake_account.namespace.id,
+                       calendar=calendar, title='%s' % i)
 
     # Add fake Threads, Messages and ImapUids.
     folder = add_fake_folder(db.session, fake_account)
@@ -30,8 +57,8 @@ def add_completely_fake_account(db, email='test@nylas.com'):
             db.session.flush()
 
             for k in random_range(1, 2):
-                uid = add_fake_imapuid(db.session, fake_account.id, msg,
-                                       folder, int('%s%s' % (msg.id, k)))
+                add_fake_imapuid(db.session, fake_account.id, msg, folder,
+                                 int('%s%s' % (msg.id, k)))
     # Add fake contacts
     for i in random_range(1, 5):
         add_fake_contact(db.session, fake_account.namespace.id, uid=str(i))
@@ -50,9 +77,179 @@ def add_completely_fake_account(db, email='test@nylas.com'):
     return fake_account
 
 
+def test_get_accounts_to_delete(db):
+    from inbox.models import Account
+    from inbox.models.util import get_accounts_to_delete
+
+    existing_account_count = db.session.query(Account.id).count()
+
+    accounts = []
+    email = 'test{}@nylas.com'
+    for i in range(1, 6):
+        account = add_completely_fake_account(db, email.format(i))
+        accounts.append(account)
+
+    # Ensure all of the accounts have been created successfully
+    assert db.session.query(Account.id).count() == (existing_account_count + 5)
+
+    # get_accounts_to_delete() with no accounts marked as deleted
+    accounts_to_delete = get_accounts_to_delete(0)
+    assert len(accounts_to_delete) == 0
+
+    # get_accounts_to_delete() with one account marked as deleted
+    accounts[0].mark_deleted()
+    db.session.commit()
+
+    accounts_to_delete = get_accounts_to_delete(0)
+    assert len(accounts_to_delete) == 1
+
+    # get_accounts_to_delete() with more than one account marked as deleted
+    for i in range(1, 4):
+        accounts[i].mark_deleted()
+    db.session.commit()
+
+    accounts_to_delete = get_accounts_to_delete(0)
+    assert len(accounts_to_delete) == 4
+
+
+def test_bulk_namespace_deletion(db):
+    from inbox.models import Account
+    from inbox.models.util import get_accounts_to_delete, delete_marked_accounts
+
+    db.session.query(Account).delete(synchronize_session=False)
+    db.session.commit()
+    assert db.session.query(Account.id).count() == 0
+
+    # Add 5 accounts
+    account_1 = add_completely_fake_account(db)
+    account_1_id = account_1.id
+
+    account_2 = add_completely_fake_account(db, "test2@nylas.com")
+    account_2_id = account_2.id
+
+    account_3 = add_completely_fake_account(db, "test3@nylas.com")
+    account_3_id = account_3.id
+
+    account_4 = add_completely_fake_account(db, "test4@nylas.com")
+    account_4_id = account_4.id
+
+    add_completely_fake_account(db, "test5@nylas.com")
+
+    # Ensure all of the accounts have been created successfully
+    assert db.session.query(Account).count() == 5
+
+    # delete_marked_accounts() with no accounts marked as deleted
+    to_delete = get_accounts_to_delete(0)
+    delete_marked_accounts(0, to_delete)
+    assert len(db.session.query(Account.id).all()) == 5
+
+    # delete_marked_accounts() with one account marked as deleted
+    account_1.mark_deleted()
+    db.session.commit()
+
+    to_delete = get_accounts_to_delete(0)
+    delete_marked_accounts(0, to_delete)
+
+    alive_accounts = db.session.query(Account.id).all()
+    assert len(alive_accounts) == 4
+    assert account_1_id not in alive_accounts
+
+    # delete_marked_accounts() with more than one account marked as deleted
+    account_2.mark_deleted()
+    account_3.mark_deleted()
+    account_4.mark_deleted()
+    db.session.commit()
+
+    to_delete = get_accounts_to_delete(0)
+    delete_marked_accounts(0, to_delete)
+
+    alive_accounts = db.session.query(Account.id).all()
+    assert len(alive_accounts) == 1
+    assert account_4_id not in alive_accounts
+    assert account_3_id not in alive_accounts
+    assert account_2_id not in alive_accounts
+
+
+@freeze_time("2016-02-02 11:01:34")
+def test_deletion_no_throttle(db, patch_requests_no_throttle):
+    from inbox.models import Account
+    from inbox.models.util import get_accounts_to_delete, delete_marked_accounts
+
+    new_accounts = set()
+    account_1 = add_completely_fake_account(db)
+    new_accounts.add(account_1.id)
+
+    account_2 = add_completely_fake_account(db, "test2@nylas.com")
+    new_accounts.add(account_2.id)
+
+    account_1.mark_deleted()
+    account_2.mark_deleted()
+    db.session.commit()
+
+    to_delete = get_accounts_to_delete(0)
+    greenlet = gevent.spawn(delete_marked_accounts, 0, to_delete, throttle=True)
+    greenlet.join()
+
+    alive_accounts = db.session.query(Account.id).all()
+
+    # Ensure the two accounts we added were deleted
+    assert new_accounts - set(alive_accounts) == new_accounts
+
+
+@freeze_time("2016-02-02 11:01:34")
+def test_deletion_metric_throttle(db, patch_requests_throttle):
+    from inbox.models import Account
+    from inbox.models.util import get_accounts_to_delete, delete_marked_accounts
+
+    account_1 = add_completely_fake_account(db)
+    account_1_id = account_1.id
+
+    account_2 = add_completely_fake_account(db, "test2@nylas.com")
+    account_2_id = account_2.id
+
+    account_1.mark_deleted()
+    account_2.mark_deleted()
+    db.session.commit()
+
+    to_delete = get_accounts_to_delete(0)
+    greenlet = gevent.spawn(delete_marked_accounts, 0, to_delete, throttle=True)
+    greenlet.join()
+
+    alive_accounts = [acc.id for acc in db.session.query(Account).all()]
+
+    # Ensure the two accounts we added are still present
+    assert account_1_id in alive_accounts
+    assert account_2_id in alive_accounts
+
+
+@freeze_time("2016-02-02 01:01:34")
+def test_deletion_time_throttle(db, patch_requests_no_throttle):
+    from inbox.models import Account
+    from inbox.models.util import get_accounts_to_delete, delete_marked_accounts
+
+    account_1 = add_completely_fake_account(db, "test5@nylas.com")
+    account_1_id = account_1.id
+
+    account_2 = add_completely_fake_account(db, "test6@nylas.com")
+    account_2_id = account_2.id
+
+    account_1.mark_deleted()
+    account_2.mark_deleted()
+    db.session.commit()
+
+    to_delete = get_accounts_to_delete(0)
+    greenlet = gevent.spawn(delete_marked_accounts, 0, to_delete, throttle=True)
+    greenlet.join()
+
+    alive_accounts = [acc.id for acc in db.session.query(Account).all()]
+
+    # Ensure the two accounts we added are still present
+    assert account_1_id in alive_accounts
+    assert account_2_id in alive_accounts
+
+
 def test_namespace_deletion(db, default_account):
-    from inbox.models import (Account, Thread, Message, Block,
-                              Contact, Event, Transaction)
+    from inbox.models import Account, Thread, Message
     from inbox.models.util import delete_namespace
 
     models = [Thread, Message]
@@ -74,7 +271,7 @@ def test_namespace_deletion(db, default_account):
         print "count for", m, ":", c
         assert c != 0
 
-    fake_account = add_fake_account(db.session)
+    fake_account = add_generic_imap_account(db.session)
     fake_account_id = fake_account.id
 
     assert fake_account_id != account.id and \
@@ -107,7 +304,7 @@ def test_namespace_deletion(db, default_account):
 
 
 def test_fake_accounts(empty_db):
-    from inbox.models import (Account, Thread, Message, Block, Part,
+    from inbox.models import (Account, Thread, Message, Block,
                               Secret, Contact, Event, Transaction)
     from inbox.models.backends.imap import ImapUid
     from inbox.models.backends.gmail import GmailAuthCredentials
@@ -163,9 +360,8 @@ def test_fake_accounts(empty_db):
 def test_multiple_fake_accounts(empty_db):
     # Add three fake accounts, check that removing one doesn't affect
     # the two others.
-    from inbox.models import (Account, Thread, Message, Block, Part,
-                              Secret, Contact, Event, Transaction)
-    from inbox.models.backends.imap import ImapUid
+    from inbox.models import (Thread, Message, Block, Secret, Contact, Event,
+                              Transaction)
     from inbox.models.backends.gmail import GmailAuthCredentials
     from inbox.models.util import delete_namespace
 

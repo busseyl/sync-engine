@@ -14,6 +14,7 @@ from inbox.models.backends.imap import ImapAccount
 from inbox.models.backends.oauth import OAuthAccount
 from inbox.models.base import MailSyncBase
 from inbox.models.secret import Secret
+from inbox.models.mixins import UpdatedAtMixin, DeletedAtMixin
 
 from nylas.logging import get_logger
 log = get_logger()
@@ -148,7 +149,7 @@ class GmailAccount(OAuthAccount, ImapAccount):
     given_name = Column(String(256))
     gender = Column(String(16))
     g_id = Column(String(32))  # `id`
-    g_id_token = Column(String(1024))  # `id_token`
+    g_id_token = Column(String(2048))  # `id_token`
     g_user_id = Column(String(32))  # `user_id`
     link = Column(String(256))
     locale = Column(String(8))
@@ -316,7 +317,7 @@ class GmailAccount(OAuthAccount, ImapAccount):
                 self.gpush_calendar_list_expiration < datetime.utcnow())
 
 
-class GmailAuthCredentials(MailSyncBase):
+class GmailAuthCredentials(MailSyncBase, UpdatedAtMixin, DeletedAtMixin):
     """
     Associate a Gmail Account with a refresh token using a
     one-to-many relationship. Refresh token ids are actually
@@ -340,7 +341,7 @@ class GmailAuthCredentials(MailSyncBase):
                               nullable=False)
 
     _scopes = Column('scopes', String(512), nullable=False)
-    g_id_token = Column(String(1024), nullable=False)
+    g_id_token = Column(String(2048), nullable=False)
     client_id = Column(String(256), nullable=False)
     client_secret = Column(String(256), nullable=False)
     is_valid = Column(Boolean, default=True, nullable=False)

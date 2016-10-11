@@ -11,30 +11,37 @@ from sqlalchemy.dialects.mysql import LONGTEXT
 
 from inbox.sqlalchemy_ext.util import MAX_TEXT_LENGTH, BigJSON, MutableList
 from inbox.models.base import MailSyncBase
-from inbox.models.mixins import HasPublicID, HasRevisions
+from inbox.models.mixins import (HasPublicID, HasRevisions, UpdatedAtMixin,
+                                 DeletedAtMixin)
 from inbox.models.calendar import Calendar
 from inbox.models.namespace import Namespace
 from inbox.models.message import Message
 from inbox.models.when import Time, TimeSpan, Date, DateSpan
 from email.utils import parseaddr
+from inbox.util.encoding import unicode_safe_truncate
 
 from nylas.logging import get_logger
 log = get_logger()
+
+EVENT_STATUSES = ["confirmed", "tentative", "cancelled"]
 
 TITLE_MAX_LEN = 1024
 LOCATION_MAX_LEN = 255
 RECURRENCE_MAX_LEN = 255
 REMINDER_MAX_LEN = 255
 OWNER_MAX_LEN = 1024
-_LENGTHS = {'location': LOCATION_MAX_LEN,
-            'owner': OWNER_MAX_LEN,
-            'recurrence': MAX_TEXT_LENGTH,
-            'reminders': REMINDER_MAX_LEN,
-            'title': TITLE_MAX_LEN,
-            'raw_data': MAX_TEXT_LENGTH}
-EVENT_STATUSES = ["confirmed", "tentative", "cancelled"]
+MAX_LENS = {
+    'location': LOCATION_MAX_LEN,
+    'owner': OWNER_MAX_LEN,
+    'recurrence': MAX_TEXT_LENGTH,
+    'reminders': REMINDER_MAX_LEN,
+    'title': TITLE_MAX_LEN,
+    'raw_data': MAX_TEXT_LENGTH
+}
 
-time_parse = lambda x: arrow.get(x).to('utc').naive
+
+def time_parse(x):
+    return arrow.get(x).to('utc').naive
 
 
 class FlexibleDateTime(TypeDecorator):
@@ -64,7 +71,8 @@ class FlexibleDateTime(TypeDecorator):
         return x == y
 
 
-class Event(MailSyncBase, HasRevisions, HasPublicID):
+class Event(MailSyncBase, HasRevisions, HasPublicID, UpdatedAtMixin,
+            DeletedAtMixin):
     """Data for events."""
     API_OBJECT_NAME = 'event'
     API_MODIFIABLE_FIELDS = ['title', 'description', 'location',
@@ -139,8 +147,9 @@ class Event(MailSyncBase, HasRevisions, HasPublicID):
     @validates('reminders', 'recurrence', 'owner', 'location', 'title',
                'raw_data')
     def validate_length(self, key, value):
-        max_len = _LENGTHS[key]
-        return value if value is None else value[:max_len]
+        if value is None:
+            return None
+        return unicode_safe_truncate(value, MAX_LENS[key])
 
     @property
     def when(self):
@@ -289,6 +298,7 @@ class Event(MailSyncBase, HasRevisions, HasPublicID):
     def organizer_email(self):
         # For historical reasons, the event organizer field is stored as
         # "Owner Name <owner@email.com>".
+
         parsed_owner = parseaddr(self.owner)
         if len(parsed_owner) == 0:
             return None
@@ -297,6 +307,18 @@ class Event(MailSyncBase, HasRevisions, HasPublicID):
             return None
 
         return parsed_owner[1]
+
+    @property
+    def organizer_name(self):
+        parsed_owner = parseaddr(self.owner)
+
+        if len(parsed_owner) == 0:
+            return None
+
+        if parsed_owner[0] == '':
+            return None
+
+        return parsed_owner[0]
 
     @property
     def is_recurring(self):

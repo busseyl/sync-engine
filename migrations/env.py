@@ -53,7 +53,8 @@ def run_migrations_offline():
     engine_manager = EngineManager(config.get_required('DATABASE_HOSTS'),
                                    config.get_required('DATABASE_USERS'),
                                    include_disabled=True)
-    context.configure(engine=engine_manager.engines[shard_id])
+    engine = engine_manager.engines[shard_id]
+    context.configure(engine=engine, url=engine.url)
 
     with context.begin_transaction():
         context.run_migrations()
@@ -72,6 +73,8 @@ def run_migrations_online():
 
     engine = engine_manager.engines[shard_id]
     connection = engine.connect()
+    # Set sane lock wait timeout value.
+    connection.execute('SET @@lock_wait_timeout=15')
     context.configure(
         connection=connection,
         target_metadata=target_metadata

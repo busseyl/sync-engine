@@ -1,4 +1,5 @@
 import abc
+import contextlib
 import uuid
 import struct
 import weakref
@@ -13,6 +14,7 @@ from sqlalchemy.types import TypeDecorator, BINARY
 from sqlalchemy.interfaces import PoolListener
 from sqlalchemy.engine import Engine
 from sqlalchemy.ext import baked
+from sqlalchemy.sql import operators
 from sqlalchemy.ext.mutable import Mutable
 from sqlalchemy.ext.declarative import DeclarativeMeta
 
@@ -24,12 +26,25 @@ log = get_logger()
 
 MAX_SANE_QUERIES_PER_SESSION = 100
 MAX_TEXT_LENGTH = 65535
-
+MAX_MYSQL_INTEGER = 2147483647
 
 bakery = baked.bakery()
 
 
 query_counts = weakref.WeakKeyDictionary()
+should_log_dubiously_many_queries = True
+
+
+# When setting up the DB for tests we do a bunch of queries all at once which
+# triggers the dreaded dubiously many queries warning. This allows us to avoid
+# that. Don't use this to silence any warnings in application code because
+# these warnings are an indicator of excessive lazy loading from the DB.
+@contextlib.contextmanager
+def disabled_dubiously_many_queries_warning():
+    global should_log_dubiously_many_queries
+    should_log_dubiously_many_queries = False
+    yield
+    should_log_dubiously_many_queries = True
 
 
 @event.listens_for(Engine, "before_cursor_execute")
@@ -43,6 +58,8 @@ def before_cursor_execute(conn, cursor, statement,
 
 @event.listens_for(Engine, 'commit')
 def before_commit(conn):
+    if not should_log_dubiously_many_queries:
+        return
     if query_counts.get(conn, 0) > MAX_SANE_QUERIES_PER_SESSION:
         log.warning('Dubiously many queries per session!',
                     query_count=query_counts.get(conn))
@@ -64,6 +81,38 @@ class ABCMixin(object):
 
 
 # Column Types
+
+
+class StringWithTransform(TypeDecorator):
+    """
+    Column type that extends sqlalchemy.String so that any strings of
+    this type will be applied a user defined transform before saving them to the
+    database, and will make sure that any `==` queries executed against a Column
+    of this type match the values that we are actually storing in the database.
+
+    Note that this will only apply the transform at the database level, before
+    saving it, so column field in the model instance will /not/ have the
+    transform applied. If you want to make sure that all model instances have
+    the transform applied, you must manually apply it using a custom property
+    setter or a @validates decorator
+    """
+    impl = String
+
+    def __init__(self, string_transform, *args, **kwargs):
+        super(StringWithTransform, self).__init__(*args, **kwargs)
+        if string_transform is None:
+            raise ValueError('Must provide a string_transform')
+        if not hasattr(string_transform, '__call__'):
+            raise TypeError('`string_transform` must be callable')
+        self._string_transform = string_transform
+
+    def process_bind_param(self, value, dialect):
+        return self._string_transform(value)
+
+    class comparator_factory(String.Comparator):
+        def __eq__(self, other):
+            other = self.type._string_transform(other)
+            return self.operate(operators.eq, other)
 
 
 # http://docs.sqlalchemy.org/en/rel_0_9/core/types.html#marshal-json-strings

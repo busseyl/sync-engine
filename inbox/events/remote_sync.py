@@ -1,6 +1,5 @@
 from datetime import datetime, timedelta
 from requests.exceptions import HTTPError
-from sqlalchemy import func
 
 from nylas.logging import get_logger
 logger = get_logger()
@@ -34,6 +33,7 @@ class EventSync(BaseSyncMonitor):
         bind_context(self, 'eventsync', account_id)
         # Only Google for now, can easily parametrize by provider later.
         self.provider = GoogleEventsProvider(account_id, namespace_id)
+        self.log = logger.new(account_id=account_id, component='calendar sync')
 
         BaseSyncMonitor.__init__(self,
                                  account_id,
@@ -87,17 +87,19 @@ class EventSync(BaseSyncMonitor):
 
 def handle_calendar_deletes(namespace_id, deleted_calendar_uids, log,
                             db_session):
-    """Delete any local Calendar rows with uid in `deleted_calendar_uids`. This
+    """
+    Delete any local Calendar rows with uid in `deleted_calendar_uids`. This
     delete cascades to associated events (if the calendar is gone, so are all
-    of its events)."""
+    of its events).
+
+    """
     deleted_count = 0
     for uid in deleted_calendar_uids:
         local_calendar = db_session.query(Calendar).filter(
             Calendar.namespace_id == namespace_id,
             Calendar.uid == uid).first()
         if local_calendar is not None:
-            # Cascades to associated events via SQLAlchemy 'delete' cascade
-            db_session.delete(local_calendar)
+            _delete_calendar(db_session, local_calendar)
             deleted_count += 1
     log.info('deleted calendars', deleted=deleted_count)
 
@@ -121,9 +123,9 @@ def handle_calendar_updates(namespace_id, calendars, log, db_session):
             local_calendar = Calendar(namespace_id=namespace_id)
             local_calendar.update(calendar)
             db_session.add(local_calendar)
-            db_session.flush()
             added_count += 1
 
+        db_session.commit()
         ids_.append((local_calendar.uid, local_calendar.id))
 
     log.info('synced added and updated calendars', added=added_count,
@@ -135,14 +137,15 @@ def handle_event_updates(namespace_id, calendar_id, events, log, db_session):
     """Persists new or updated Event objects to the database."""
     added_count = 0
     updated_count = 0
-    existing_event_count = db_session.query(func.count(Event.id)).filter(
+    existing_event_query = db_session.query(Event).filter(
         Event.namespace_id == namespace_id,
-        Event.calendar_id == calendar_id).scalar()
+        Event.calendar_id == calendar_id).exists()
+    events_exist = db_session.query(existing_event_query).scalar()
     for event in events:
         assert event.uid is not None, 'Got remote item with null uid'
 
         local_event = None
-        if existing_event_count:
+        if events_exist:
             # Skip this lookup if there are no local events at all, for faster
             # first sync.
             local_event = db_session.query(Event).filter(
@@ -230,7 +233,6 @@ class GoogleEventSync(EventSync):
                 'bypassing sync')
 
     def _refresh_gpush_subscriptions(self):
-
         with session_scope(self.namespace_id) as db_session:
             account = db_session.query(Account).get(self.account_id)
 
@@ -253,16 +255,19 @@ class GoogleEventSync(EventSync):
                     if exc.response.status_code == 404:
                         self.log.warning(
                             'Tried to subscribe to push notifications'
-                            'for a deleted calendar. Deleting local calendar',
-                            calendar_id=cal.id,
-                            calendar_uid=cal.uid)
-                        db_session.delete(cal)
+                            ' for a deleted or inaccessible calendar. Deleting'
+                            ' local calendar',
+                            calendar_id=cal.id, calendar_uid=cal.uid)
+                        _delete_calendar(db_session, cal)
                     else:
+                        self.log.error(
+                            'Error while updating calendar push notification '
+                            'subscription', cal_id=cal.id, calendar_uid=cal.uid,
+                            status_code=exc.response.status_code)
                         raise exc
 
     def _sync_data(self):
         with session_scope(self.namespace_id) as db_session:
-
             account = db_session.query(Account).get(self.account_id)
             if account.should_update_calendars(MAX_TIME_WITHOUT_SYNC):
                 self._sync_calendar_list(account, db_session)
@@ -279,10 +284,13 @@ class GoogleEventSync(EventSync):
                         self.log.warning(
                             'Tried to sync a deleted calendar.'
                             'Deleting local calendar.',
-                            calendar_id=cal.id,
-                            calendar_uid=cal.uid)
-                        db_session.delete(cal)
+                            calendar_id=cal.id, calendar_uid=cal.uid)
+                        _delete_calendar(db_session, cal)
                     else:
+                        self.log.error(
+                            'Error while syncing calendar',
+                            cal_id=cal.id, calendar_uid=cal.uid,
+                            status_code=exc.response.status_code)
                         raise exc
 
     def _sync_calendar_list(self, account, db_session):
@@ -308,3 +316,29 @@ class GoogleEventSync(EventSync):
                              event_changes, self.log, db_session)
         calendar.last_synced = sync_timestamp
         db_session.commit()
+
+
+def _delete_calendar(db_session, calendar):
+    """
+    Delete the calendar after deleting its events in batches.
+
+    Note we deliberately do not rely on the configured delete cascade -- doing
+    so for a calendar with many events can result in the session post-flush
+    processing (Transaction record creation) blocking the event loop.
+
+    """
+    count = 0
+    for e in calendar.events:
+        db_session.delete(e)
+        count += 1
+        if count % 100 == 0:
+            # Issue a DELETE for every 100 events.
+            # This will ensure that when the DELETE for the calendar is issued,
+            # the number of objects in the session and for which to create
+            # Transaction records is small.
+            db_session.commit()
+    db_session.commit()
+
+    # Delete the calendar
+    db_session.delete(calendar)
+    db_session.commit()
